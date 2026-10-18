@@ -33,8 +33,12 @@ public final class HuskWifi extends WifiManager {
     }
 
     @Override public WifiInfo getConnectionInfo() {
+        String[] c = host();
+        /* Off, or with nothing up: null, exactly as this answered before the bridge (the platform's own class has no
+         * connection to report), so a game's flow is unchanged until the switch is turned on. */
+        if (c == null || c.length < 3 || c[2].isEmpty()) return null;
         WifiInfo w = new WifiInfo();
-        /* What Android shows an app without the location permission, and what Husk answered before the bridge. */
+        /* What Android shows an app without the location permission: no SSID, and a MAC Android no longer gives out. */
         w.huskProps.put("SSID", "<unknown ssid>");
         w.huskProps.put("BSSID", "02:00:00:00:00:00");
         w.huskProps.put("MacAddress", "02:00:00:00:00:00");
@@ -42,27 +46,22 @@ public final class HuskWifi extends WifiManager {
         w.huskProps.put("Rssi", Integer.valueOf(-55));
         w.huskProps.put("LinkSpeed", Integer.valueOf(433));
         w.huskProps.put("Frequency", Integer.valueOf(2412));
-        w.huskProps.put("IpAddress", Integer.valueOf(0));
-        String[] c = host();
-        if (c != null && c.length > 7) {
-            if (!c[7].isEmpty()) { w.huskProps.put("MacAddress", c[7]); w.huskProps.put("BSSID", c[7]); }
-            if (!c[2].isEmpty()) w.huskProps.put("IpAddress", Integer.valueOf(packed(c[2])));
-        }
+        w.huskProps.put("IpAddress", Integer.valueOf(packed(c[2])));
+        if (c.length > 7 && !c[7].isEmpty()) { w.huskProps.put("MacAddress", c[7]); w.huskProps.put("BSSID", c[7]); }
         return w;
     }
 
     @Override public android.net.DhcpInfo getDhcpInfo() {
-        android.net.DhcpInfo d = new android.net.DhcpInfo();
         String[] c = host();
-        if (c != null && c.length > 7 && !c[2].isEmpty()) {
-            d.ipAddress = packed(c[2]);
-            d.netmask = packed(c[3]);
-            d.gateway = packed(c[5]);
-            d.dns1 = c.length > 8 ? packed(c[8]) : 0;
-            d.dns2 = c.length > 9 ? packed(c[9]) : 0;
-            d.serverAddress = d.gateway;              /* on any home LAN the router is the DHCP server */
-            d.leaseDuration = 86400;
-        }
+        if (c == null || c.length < 8 || c[2].isEmpty()) return null;
+        android.net.DhcpInfo d = new android.net.DhcpInfo();
+        d.ipAddress = packed(c[2]);
+        d.netmask = packed(c[3]);
+        d.gateway = packed(c[5]);
+        d.dns1 = c.length > 8 ? packed(c[8]) : 0;
+        d.dns2 = c.length > 9 ? packed(c[9]) : 0;
+        d.serverAddress = d.gateway;              /* on any home LAN the router is the DHCP server */
+        d.leaseDuration = 86400;
         return d;
     }
 

@@ -263,37 +263,36 @@ static jobj *Net_inet(const char *ipv4)
     return o;
 }
 
-/* WifiManager/WifiInfo: what Android's Wi-Fi connection info would say. */
+/* WifiManager/WifiInfo: what Android's Wi-Fi connection info would say. Off, the questions answer null, exactly as they
+ * did before the bridge (there was no implementation); on, they answer with the phone's own Wi-Fi. */
 static void WM_getConnectionInfo(tl_jcall *c)
 {
+    tl_netcfg cfg;
+    if (!net_bridge("WifiManager.getConnectionInfo", &cfg)) { c->ret = vl(NULL); return; }
     jobj *w = tl_jni_new_object(tl_jni_class("android/net/wifi/WifiInfo"));
-    /* What an app without the location permission sees on Android, and what Husk answered before the bridge. */
+    /* What an app without the location permission sees on Android: no SSID, and a MAC Android no longer gives out. */
     nset_s(w, "SSID", "<unknown ssid>"); nset_i(w, "NetworkId", -1); nset_i(w, "Rssi", -55); nset_i(w, "LinkSpeed", 433);
     nset_i(w, "Frequency", 2412); nset_i(w, "IpAddress", 0);
     nset_s(w, "BSSID", "02:00:00:00:00:00"); nset_s(w, "MacAddress", "02:00:00:00:00:00");
-    tl_netcfg cfg;
-    if (net_bridge("WifiManager.getConnectionInfo", &cfg)) {
-        nset_i(w, "IpAddress", (int)cfg.ip_int);
-        if (cfg.mac[0]) { nset_s(w, "MacAddress", cfg.mac); nset_s(w, "BSSID", cfg.mac); }
-        /* the private names, for a game that reads the fields rather than the getters */
-        nset_i(w, "mIpAddress", (int)cfg.ip_int);
-        if (cfg.mac[0]) nset_s(w, "mMacAddress", cfg.mac);
-    }
+    nset_i(w, "IpAddress", (int)cfg.ip_int);
+    if (cfg.mac[0]) { nset_s(w, "MacAddress", cfg.mac); nset_s(w, "BSSID", cfg.mac); }
+    /* the private names, for a game that reads the fields rather than the getters */
+    nset_i(w, "mIpAddress", (int)cfg.ip_int);
+    if (cfg.mac[0]) nset_s(w, "mMacAddress", cfg.mac);
     c->ret = vl(w);
 }
 static void WM_getDhcpInfo(tl_jcall *c)
 {
-    jobj *d = tl_jni_new_object(tl_jni_class("android/net/DhcpInfo"));
     tl_netcfg cfg;
-    if (net_bridge("WifiManager.getDhcpInfo", &cfg)) {
-        nset_i(d, "ipAddress", (int)cfg.ip_int);
-        nset_i(d, "gateway", (int)cfg.gateway_int);
-        nset_i(d, "netmask", (int)cfg.netmask_int);
-        nset_i(d, "dns1", (int)(cfg.ndns > 0 ? cfg.dns_int[0] : 0));
-        nset_i(d, "dns2", (int)(cfg.ndns > 1 ? cfg.dns_int[1] : 0));
-        nset_i(d, "serverAddress", (int)cfg.gateway_int);            /* the router is the DHCP server on any home LAN */
-        nset_i(d, "leaseDuration", 86400);
-    }
+    if (!net_bridge("WifiManager.getDhcpInfo", &cfg)) { c->ret = vl(NULL); return; }
+    jobj *d = tl_jni_new_object(tl_jni_class("android/net/DhcpInfo"));
+    nset_i(d, "ipAddress", (int)cfg.ip_int);
+    nset_i(d, "gateway", (int)cfg.gateway_int);
+    nset_i(d, "netmask", (int)cfg.netmask_int);
+    nset_i(d, "dns1", (int)(cfg.ndns > 0 ? cfg.dns_int[0] : 0));
+    nset_i(d, "dns2", (int)(cfg.ndns > 1 ? cfg.dns_int[1] : 0));
+    nset_i(d, "serverAddress", (int)cfg.gateway_int);            /* the router is the DHCP server on any home LAN */
+    nset_i(d, "leaseDuration", 86400);
     c->ret = vl(d);
 }
 static void WM_isWifiEnabled(tl_jcall *c)
@@ -442,8 +441,24 @@ static void Inet_getAddress(tl_jcall *c)
     c->ret = vl(arr);
 }
 static void Inet_getHostName(tl_jcall *c) { c->ret = tl_jni_get_field(c->self, "host", "Ljava/lang/String;"); }
-static void Inet_isLoopbackAddress(tl_jcall *c) { (void)c; c->ret = vz(0); }
-static void Inet_isAnyLocalAddress(tl_jcall *c) { (void)c; c->ret = vz(0); }
+static void Inet_getLocalHost(tl_jcall *c)      /* static: the address a game should announce is the phone's own */
+{
+    (void)c;
+    tl_netcfg cfg;
+    c->ret = vl(net_bridge("InetAddress.getLocalHost", &cfg) && cfg.ip[0] ? Net_inet(cfg.ip) : NULL);
+}
+static void Inet_isLoopbackAddress(tl_jcall *c)
+{
+    jvalue s = tl_jni_get_field(c->self, "host", "Ljava/lang/String;");
+    const char *ip = s.l ? tl_jni_string(s.l) : NULL;
+    c->ret = vz(ip && !strncmp(ip, "127.", 4));
+}
+static void Inet_isAnyLocalAddress(tl_jcall *c)
+{
+    jvalue s = tl_jni_get_field(c->self, "host", "Ljava/lang/String;");
+    const char *ip = s.l ? tl_jni_string(s.l) : NULL;
+    c->ret = vz(ip && !strcmp(ip, "0.0.0.0"));
+}
 static void Inet_getLoopbackAddress(tl_jcall *c) { (void)c; c->ret = vl(Net_inet("127.0.0.1")); }
 
 /* Enumeration: how java.net.NetworkInterface hands its list out (getNetworkInterfaces/getInetAddresses), and how the
@@ -525,6 +540,7 @@ static const tl_jhle k_net[] = {
     M_("java/net/InetAddress", "isLoopbackAddress", "()Z", Inet_isLoopbackAddress),
     M_("java/net/InetAddress", "isAnyLocalAddress", "()Z", Inet_isAnyLocalAddress),
     M_("java/net/InetAddress", "getLoopbackAddress", "()Ljava/net/InetAddress;", Inet_getLoopbackAddress),
+    M_("java/net/InetAddress", "getLocalHost", "()Ljava/net/InetAddress;", Inet_getLocalHost),
     M_("java/net/NetworkInterface", "getNetworkInterfaces", "()Ljava/util/Enumeration;", NetIF_getNetworkInterfaces),
     M_("java/net/NetworkInterface", "getByName", "(Ljava/lang/String;)Ljava/net/NetworkInterface;", NetIF_getByName),
     M_("java/net/NetworkInterface", "getByIndex", "(I)Ljava/net/NetworkInterface;", NetIF_getByName),

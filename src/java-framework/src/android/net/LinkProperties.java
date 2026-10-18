@@ -21,7 +21,7 @@ public final class LinkProperties implements android.os.Parcelable {
             if (v < 0 || v > 255) return null;
             b[i] = (byte) v;
         }
-        try { return java.net.InetAddress.getByAddress(b); } catch (Exception e) { return null; }
+        try { return java.net.InetAddress.getByAddress(b); } catch (Throwable t) { return null; }
     }
     private static int prefix() {
         String[] c = host();
