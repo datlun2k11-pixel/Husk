@@ -573,20 +573,22 @@ static int b_getifaddrs(guest_ifaddrs **out)
 {
     struct ifaddrs *list;
     if (getifaddrs(&list) != 0) { tl_set_guest_errno(tl_errno_to_guest(errno)); return -1; }
-    /* With the bridge on (Settings > Network Bridge), the guest sees an Android-shaped list: Apple's own interfaces
-     * (AWDL, a VPN's tunnels, the hotspot bridge, the low latency WLAN) are not there, the phone's Wi-Fi is called wlan0
-     * and loopback lo. Off, the host's names are passed through as before. */
+    /* With the bridge on (Settings > Network Bridge), the guest is shown the one network it is really on: the interface
+     * its packets leave by, named as Android names it (wlan0, rmnet0), and loopback as lo. Apple's own interfaces (AWDL,
+     * a VPN's tunnels, the personal hotspot bridge, the low latency WLAN) are not there -- and neither is the phone's
+     * cellular interface while it is on Wi-Fi, so a game taking the first non-loopback address cannot take the one
+     * address on the phone that cannot reach the LAN. Off, the host's names are passed through as before. */
     bool bridge = tl_netcfg_bridge();
     char primary[24] = "", android_if[16] = "";
     if (bridge) tl_netcfg_primary(primary, sizeof(primary), android_if, sizeof(android_if));
     guest_ifaddrs *head = NULL, **tail = &head;
     for (struct ifaddrs *i = list; i; i = i->ifa_next) {
         if (!i->ifa_addr || (i->ifa_addr->sa_family != AF_INET && i->ifa_addr->sa_family != AF_INET6)) continue;
-        if (bridge && tl_netcfg_if_hidden(i->ifa_name)) continue;
         const char *name = i->ifa_name;
         if (bridge) {
             if (primary[0] && !strcmp(name, primary)) name = android_if;
             else if (!strcmp(name, "lo0")) name = "lo";
+            else continue;
         }
         size_t nl = strlen(name) + 1;
         uint8_t *blk = calloc(1, sizeof(guest_ifaddrs) + 3 * 32 + nl);
