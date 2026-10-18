@@ -44,6 +44,21 @@ jobs:
           sudo rm -rf "$HOME/Library/Developer/CoreSimulator/Caches"/* || true
           echo "== after"; df -h /
 
+      # The app is signed ad hoc with src/app/Husk/Husk.entitlements at the end of
+      # a build that takes half an hour, and AMFI, which is what reads them on a
+      # device, is stricter than anything else here: a "--" inside an XML comment is
+      # valid XML and a syntax error to it. The only symptom is packaging failing
+      # right at the end, so putting AMFI's parser on the file first costs seconds.
+      - name: the entitlements parse
+        run: |
+          cp /bin/echo "$RUNNER_TEMP/entitlements-test"
+          if ! codesign --force --sign - \
+                 --entitlements src/app/Husk/Husk.entitlements "$RUNNER_TEMP/entitlements-test"; then
+            echo "Husk.entitlements is not accepted by AMFI (see above); packaging would fail at the end" >&2
+            exit 1
+          fi
+          codesign -d --entitlements - "$RUNNER_TEMP/entitlements-test" 2>&1 | tail -20
+
       - name: tools the build scripts call
         run: |
           xcodebuild -version

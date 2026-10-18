@@ -197,7 +197,14 @@ sign() { codesign --force --sign - --timestamp=none "$@"; }
 find "$SAPP" -name "*.dylib" -not -path "*/Frameworks/*.framework/*" | while read -r f; do sign "$f"; done
 for fw in "$SAPP"/Frameworks/*.framework; do [ -d "$fw" ] && sign "$fw"; done
 for ex in "$SAPP"/PlugIns/*.appex; do [ -d "$ex" ] && sign "$ex"; done
-sign --entitlements "$ENT" "$SAPP"
+# AMFI, which reads these on a device, is stricter than the parser plutil uses: a
+# "--" inside an XML comment, for one, is a syntax error to it and packaging would
+# stop here with only "Failed to parse entitlements" to go on.
+if ! sign --entitlements "$ENT" "$SAPP"; then
+    echo "==> codesign refused $ENT_BASE (see above); AMFI reads entitlements more strictly than plutil" >&2
+    rm -rf "$STAGE"
+    exit 1
+fi
 echo "==> entitlements in the signed app:"
 EMBEDDED_ENTS=$(codesign -d --entitlements - "$SAPP" 2>&1 || true)
 REQUIRED_PATTERN="get-task-allow|increased-memory|extended-virtual"
