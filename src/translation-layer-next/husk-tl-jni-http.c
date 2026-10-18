@@ -464,6 +464,17 @@ static void Enum_nextElement(tl_jcall *c)
 
 static void LP_getDomains(tl_jcall *c) { c->ret = vl(NULL); }
 static void LP_getMtu(tl_jcall *c) { c->ret = vi(1500); }
+/* "Is there a network?", asked of the link itself rather than of ConnectivityManager -- what a game checks before it
+ * offers its online mode. The answer is the phone's own link, with the bridge on. */
+static void LP_hasIPv4Address(tl_jcall *c) { (void)c; tl_netcfg g; c->ret = vz(net_bridge("LinkProperties.hasIPv4Address", &g) && g.ip[0]); }
+static void LP_hasIPv4DefaultRoute(tl_jcall *c) { (void)c; tl_netcfg g; c->ret = vz(net_bridge("LinkProperties.hasIPv4DefaultRoute", &g) && g.gateway[0]); }
+static void LP_hasIPv4DnsServer(tl_jcall *c) { (void)c; tl_netcfg g; c->ret = vz(net_bridge("LinkProperties.hasIPv4DnsServer", &g) && g.ndns > 0); }
+static void LP_isProvisioned(tl_jcall *c)
+{
+    (void)c;
+    tl_netcfg g;
+    c->ret = vz(net_bridge("LinkProperties.isProvisioned", &g) && g.ip[0] && g.gateway[0] && g.ndns > 0);
+}
 
 /* The phone has its network, as far as a game asking Android about it can tell: one active connection, over Wi-Fi, that is up. */
 static const tl_jhle k_net[] = {
@@ -482,6 +493,14 @@ static const tl_jhle k_net[] = {
     M_("android/net/LinkProperties", "getRoutes", "()Ljava/util/List;", LP_getRoutes),
     M_("android/net/LinkProperties", "getDomains", "()Ljava/lang/String;", LP_getDomains),
     M_("android/net/LinkProperties", "getMtu", "()I", LP_getMtu),
+    M_("android/net/LinkProperties", "hasIPv4Address", "()Z", LP_hasIPv4Address),
+    M_("android/net/LinkProperties", "hasIPv4DefaultRoute", "()Z", LP_hasIPv4DefaultRoute),
+    M_("android/net/LinkProperties", "hasIPv4DnsServer", "()Z", LP_hasIPv4DnsServer),
+    M_("android/net/LinkProperties", "isProvisioned", "()Z", LP_isProvisioned),
+    M_("android/net/LinkProperties", "isIpv4Provisioned", "()Z", LP_isProvisioned),
+    M_("android/net/LinkProperties", "hasIpv4Address", "()Z", LP_hasIPv4Address),
+    M_("android/net/LinkProperties", "hasIpv4DefaultRoute", "()Z", LP_hasIPv4DefaultRoute),
+    M_("android/net/LinkProperties", "hasIpv4DnsServer", "()Z", LP_hasIPv4DnsServer),
     M_("android/net/LinkAddress", "getAddress", "()Ljava/net/InetAddress;", LA_getAddress),
     M_("android/net/LinkAddress", "getPrefixLength", "()I", LA_getPrefixLength),
     M_("android/net/RouteInfo", "getGateway", "()Ljava/net/InetAddress;", RI_getGateway),

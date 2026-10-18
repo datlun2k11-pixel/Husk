@@ -29,8 +29,9 @@ public final class LinkProperties implements android.os.Parcelable {
         try { return Integer.parseInt(c[4]); } catch (NumberFormatException e) { return 24; }
     }
     public String getInterfaceName() {
+        /* Named wlan0/rmnet0, as an Android app expects (the phone's own names -- en0, pdp_ip0 -- are not Android's). */
         String[] c = host();
-        return c != null && c.length > 1 && !c[1].isEmpty() ? c[1] : "en0";
+        return c != null && c.length > 1 && !c[1].isEmpty() ? c[1] : null;
     }
     public java.util.List<java.net.InetAddress> getDnsServers() {
         java.util.ArrayList<java.net.InetAddress> out = new java.util.ArrayList<>();
@@ -49,6 +50,9 @@ public final class LinkProperties implements android.os.Parcelable {
         return out;
     }
     public boolean hasIPv4Address() { String[] c = host(); return c != null && c.length > 2 && !c[2].isEmpty(); }
+    public boolean hasIPv4DefaultRoute() { String[] c = host(); return c != null && c.length > 5 && !c[5].isEmpty(); }
+    public boolean isIpv4Provisioned() { return hasIPv4Address() && hasIPv4DefaultRoute() && !getDnsServers().isEmpty(); }
+    public boolean isProvisioned() { return isIpv4Provisioned(); }
     public boolean hasIPv4DnsServer() { return !getDnsServers().isEmpty(); }
     public String getDomains() { return null; }
     public boolean isPrivateDnsActive() { return false; }
@@ -88,12 +92,11 @@ public final class LinkProperties implements android.os.Parcelable {
     public boolean hasExcludeRoute() { return false; }
     public boolean hasGlobalIPv6Address() { return false; }
     public boolean hasGlobalIpv6Address() { return false; }
-    public boolean hasIPv4DefaultRoute() { return false; }
     public boolean hasIPv6DefaultRoute() { return false; }
     public boolean hasIPv6DnsServer() { return false; }
-    public boolean hasIpv4Address() { return false; }
-    public boolean hasIpv4DefaultRoute() { return false; }
-    public boolean hasIpv4DnsServer() { return false; }
+    public boolean hasIpv4Address() { return hasIPv4Address(); }
+    public boolean hasIpv4DefaultRoute() { return hasIPv4DefaultRoute(); }
+    public boolean hasIpv4DnsServer() { return hasIPv4DnsServer(); }
     public boolean hasIpv4PcscfServer() { return false; }
     public boolean hasIpv4UnreachableDefaultRoute() { return false; }
     public boolean hasIpv6DefaultRoute() { return false; }
@@ -117,9 +120,7 @@ public final class LinkProperties implements android.os.Parcelable {
     public boolean isIdenticalTcpBufferSizes(android.net.LinkProperties p0) { return false; }
     public boolean isIdenticalValidatedPrivateDnses(android.net.LinkProperties p0) { return false; }
     public boolean isIdenticalWakeOnLan(android.net.LinkProperties p0) { return false; }
-    public boolean isIpv4Provisioned() { return false; }
     public boolean isIpv6Provisioned() { return false; }
-    public boolean isProvisioned() { return false; }
     public boolean isReachable(java.net.InetAddress p0) { return false; }
     public boolean isWakeOnLanSupported() { return (huskFill.get("WakeOnLanSupported") instanceof Boolean ? (Boolean) huskFill.get("WakeOnLanSupported") : false); }
     public boolean removeDnsServer(java.net.InetAddress p0) { return false; }
