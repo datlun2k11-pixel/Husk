@@ -19,5 +19,13 @@
 	     probed at startup and the guest is sized to whatever actually maps. -->
 	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
 	<true/>
+	<!-- How a LAN game finds its opponents: the host announces itself by broadcast
+	     or to a multicast group, and the clients listen. iOS refuses both directions
+	     without this entitlement, which Apple grants per App ID -- so a signer that
+	     can carry it (TrollStore, a jailbroken device, or a certificate that injects
+	     entitlements) makes LAN discovery work, and one that cannot drops it and
+	     leaves unicast, which is what joining by address has always used. -->
+	<key>com.apple.developer.networking.multicast</key>
+	<true/>
 </dict>
 </plist>
