@@ -30,15 +30,28 @@ jobs:
       - name: run
         run: ./zipstream-test
 
-  # macos-14 runs on arm64, which is what the layer's inline assembly and JIT
-  # substrate need: building the harness compiles and links every source of the
-  # translation layer, and the binary is the streaming test again.
-  layer-harness:
-    name: the layer builds and links (arm64)
+  # macos-14 runs on arm64, which is what the layer's inline assembly, its JIT
+  # calls and Darwin's thread-state structs need: an Intel machine cannot even
+  # compile those files. This compiles exactly what tools/regress/build.sh
+  # compiles -- same files, same flags -- plus the old loader's sources, which
+  # the harness leaves out (and where tl_log_line lives, so the harness as it
+  # stands cannot link at all); nothing is linked here on purpose.
+  layer-compiles:
+    name: the layer compiles (arm64)
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - name: build the harness and run the asset-streaming test
+      - name: compile every source of the translation layer
         run: |
-          bash tools/regress/build.sh tools/zipstream-test.c "$RUNNER_TEMP/zipstream-test"
-          "$RUNNER_TEMP/zipstream-test"
+          T=src/translation-layer
+          N=src/translation-layer-next
+          mkdir -p "$RUNNER_TEMP/obj"
+          fail=0
+          for f in $N/*.c $N/*.m $T/*.c $T/*.m; do
+            [ -e "$f" ] || continue
+            case $f in *-unity-app.c) continue;; esac   # asks the app glue, as in tools/regress/build.sh
+            clang -c -g -O1 -fobjc-arc -I$T -I$N \
+              -Wno-unused-function -Wno-deprecated-declarations \
+              "$f" -o "$RUNNER_TEMP/obj/$(basename "$f").o" || fail=1
+          done
+          exit $fail
