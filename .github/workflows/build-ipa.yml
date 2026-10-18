@@ -1,0 +1,114 @@
+name: build IPA
+
+# Husk needs Xcode 26 (its JIT helper extension targets iOS 26), and the Mac it
+# is developed on here is an Intel one capped at macOS 12, which cannot install
+# it: the IPA is built on a runner and downloaded from the run's artifacts.
+#
+#   gh workflow run "build IPA"
+#   gh run watch $(gh run list --workflow "build IPA" -L1 --json databaseId -q '.[0].databaseId')
+#   gh run download --name Husk-ipa --dir ~/Desktop
+#
+# The build is the repository's own ./scripts/ci_build.sh -- QEMU, ANGLE, MoltenVK,
+# the guest kernel and the app -- which takes about an hour from a cold runner.
+# Two things it cannot do are added around it, see the steps below: the Android
+# files it normally takes from a Lineage system image, and Husk's Java framework
+# dex rebuilt from this checkout.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: build-ipa
+  cancel-in-progress: false
+
+jobs:
+  ipa:
+    name: Husk.ipa
+    runs-on: macos-26
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: room on disk
+        run: |
+          echo "== before"; df -h /
+          # The image ships several Xcodes (tens of gigabytes each) and the
+          # simulator runtimes nothing here builds for: keep the selected SDKs
+          # and drop the rest, or the build runs out of room partway.
+          sel="$(cd "$(xcode-select -p)" && pwd -P | sed 's|/Contents/Developer$||')"
+          for d in /Applications/Xcode*.app; do
+            [ -e "$d" ] || continue
+            [ "$(cd "$d" && pwd -P)" = "$sel" ] && continue
+            echo "removing $d"
+            sudo rm -rf "$d"
+          done
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/*
+          sudo rm -rf "$HOME/Library/Developer/CoreSimulator/Caches"/* || true
+          echo "== after"; df -h /
+
+      - name: tools the build scripts call
+        run: |
+          xcodebuild -version
+          brew install meson xcodegen
+          rustup target add aarch64-apple-ios
+          meson --version; ninja --version; xcodegen --version; cargo --version
+
+      - name: QEMU, ANGLE, MoltenVK, the guest kernel and the app
+        run: ./scripts/ci_build.sh "$RUNNER_TEMP/Husk-check.ipa"
+        timeout-minutes: 300
+
+      - name: the Android files the repository does not carry
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # build/java-runtime (libcore, ICU, conscrypt, tzdata, framework-res.apk)
+          # and build/android-system (fonts, certificates) are taken from a Lineage
+          # system image, which no script here can fetch; the project itself only
+          # warns when they are missing, and the app then starts no game at all.
+          # The published Husk.ipa carries them, and Android's own files do not
+          # depend on the Husk commit.
+          gh release download --repo Leviidev/Husk --pattern Husk.ipa \
+            --dir "$RUNNER_TEMP/rel" --clobber
+          unzip -q "$RUNNER_TEMP/rel/Husk.ipa" -d "$RUNNER_TEMP/rel/x"
+          APP="$RUNNER_TEMP/rel/x/Payload/Husk.app"
+          rsync -a --delete "$APP/java-runtime/" build/java-runtime/
+          rsync -a --delete "$APP/android-system/" build/android-system/
+          # Husk's Java framework is rebuilt here instead, so the dex inside the app
+          # is this checkout's (package_ipa.sh refuses to package a mismatched one).
+          curl -fsL -o "$RUNNER_TEMP/r8.jar" \
+            https://storage.googleapis.com/r8-releases/raw/8.7.18/r8.jar
+          HUSK_JDK="$(/usr/libexec/java_home)" HUSK_D8="$RUNNER_TEMP/r8.jar" \
+            ./src/java-framework/build.sh build/java-runtime/husk-framework.dex
+
+      - name: package the IPA
+        run: |
+          ./scripts/package_ipa.sh build/Husk.ipa
+          ./scripts/package_ipa.sh --trollstore build/Husk.tipa
+          ls -lh build/Husk.ipa build/Husk.tipa
+
+      - name: the IPA carries the fix and the runtime
+        run: |
+          set -euo pipefail
+          unzip -q build/Husk.ipa -d "$RUNNER_TEMP/out"
+          APP="$RUNNER_TEMP/out/Payload/Husk.app"
+          # The streamed asset read is this branch's; no other Husk binary has this.
+          strings "$APP/Husk" | grep -q TL_ZIP_TRIM_MB
+          # Without these the app installs, launches, and then cannot start a game.
+          test -f "$APP/java-runtime/husk-framework.dex"
+          test -f "$APP/java-runtime/framework-res.apk"
+          test -d "$APP/android-system/fonts"
+          for lib in libqemu-aarch64-softmmu.dylib libANGLE-shared.dylib libhuskps4.dylib; do
+            test -f "$APP/Frameworks/$lib"
+          done
+          plutil -p "$APP/Info.plist" | grep -E "HuskBuildCommit|CFBundleShortVersionString"
+          du -sh "$APP"
+          echo "built from $(git rev-parse --short HEAD)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Husk-ipa
+          path: |
+            build/Husk.ipa
+            build/Husk.tipa
+          if-no-files-found: error
+          retention-days: 14
