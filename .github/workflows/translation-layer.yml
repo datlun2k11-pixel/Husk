@@ -23,7 +23,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev zip
       - name: build
         run: |
-          clang -g -O1 -Wall -Wextra \
+          clang -g -O1 -Wall -Wextra -D_DEFAULT_SOURCE \
             -I src/translation-layer -I src/translation-layer-next \
             tools/zipstream-test.c src/translation-layer/husk-tl-zip.c \
             -lz -o zipstream-test

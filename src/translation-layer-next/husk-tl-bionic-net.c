@@ -17,6 +17,8 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -565,7 +567,6 @@ static const char *b_inet_ntop(int af, const void *src, char *dst, socklen_t siz
  * IFF_MULTICAST is 0x1000 on Linux, 0x8000 here.
  */
 #include <ifaddrs.h>
-#include <net/if.h>
 typedef struct guest_ifaddrs { struct guest_ifaddrs *next; char *name; uint32_t flags; void *addr, *netmask, *ifu, *data; } guest_ifaddrs;
 static int b_getifaddrs(guest_ifaddrs **out)
 {
