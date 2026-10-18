@@ -203,18 +203,24 @@ static bool fetch_from_apks(const char *name, uint8_t **out, size_t *len)
     for (int i = 0; i < G.napks; i++) {
         const tl_zip_entry *e = tl_zip_find(&G.apks[i], path);
         if (!e) continue;
-        const uint8_t *data; size_t n; bool owned; char err[160];
-        if (!tl_zip_data(&G.apks[i], e, (size_t)1 << 30, &data, &n, &owned, err, sizeof(err))) {
+        /* inflated straight into the one buffer the image is built from: a 300 MiB libil2cpp
+         * costs 300 MiB here, where a whole-entry read plus a copy cost it twice */
+        char err[160];
+        tl_zip_stream *st = tl_zip_stream_open(&G.apks[i], e, (size_t)1 << 30, err, sizeof(err));
+        if (!st) {
             tl_log_line("ld: %s: %s", name, err);
             return false;
         }
-        if (!owned) {
-            uint8_t *copy = malloc(n);
-            if (!copy) return false;
-            memcpy(copy, data, n);
-            data = copy;
+        size_t n = (size_t)tl_zip_stream_len(st);
+        uint8_t *buf = malloc(n ? n : 1);
+        size_t got = n && buf ? tl_zip_stream_read(st, buf, n, err, sizeof(err)) : 0;
+        tl_zip_stream_close(st);
+        if (!buf || got != n) {
+            free(buf);
+            tl_log_line("ld: %s: %s", name, got != n ? err : "out of memory");
+            return false;
         }
-        *out = (uint8_t *)data;
+        *out = buf;
         *len = n;
         return true;
     }
@@ -2002,6 +2008,10 @@ static tl_lib *load_locked(const char *name, int depth, bool system)
     if (!ensure_tcb()) { free(file); return NULL; }
     L = map_library(name, file, flen);
     free(file);
+    /* The library's bytes came out of the APKs' mappings (an arm64 game can
+     * carry a hundred of these); the pages they faulted in are of no use
+     * now that the image sits in the JIT region. */
+    for (int i = 0; i < G.napks; i++) tl_zip_trim(&G.apks[i]);
     if (!L) return NULL;
     L->system = system;
 

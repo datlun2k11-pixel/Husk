@@ -169,11 +169,15 @@ static bool open_path(const char *path)
         if (i == 1) snprintf(name, sizeof(name), "classes.dex"); else snprintf(name, sizeof(name), "classes%d.dex", i);
         const tl_zip_entry *e = tl_zip_find(&z, name);
         if (!e) break;
-        const uint8_t *data; size_t len; bool owned;
-        if (!tl_zip_data(&z, e, (size_t)1 << 30, &data, &len, &owned, err, sizeof(err))) continue;
-        uint8_t *copy = malloc(len);
-        memcpy(copy, data, len);
-        if (owned) free((void *)data);
+        /* inflated straight into the buffer the runtime keeps: one copy of classes.dex, not two */
+        char derr[160];
+        tl_zip_stream *st = tl_zip_stream_open(&z, e, (size_t)1 << 30, derr, sizeof(derr));
+        if (!st) continue;
+        size_t len = (size_t)tl_zip_stream_len(st);
+        uint8_t *copy = len ? malloc(len) : NULL;
+        size_t got = len && copy ? tl_zip_stream_read(st, copy, len, derr, sizeof(derr)) : 0;
+        tl_zip_stream_close(st);
+        if (!len || got != len) { free(copy); continue; }
         char label[96];
         const char *slash = strrchr(path, '/');
         snprintf(label, sizeof(label), "%s!%s", slash ? slash + 1 : path, name);

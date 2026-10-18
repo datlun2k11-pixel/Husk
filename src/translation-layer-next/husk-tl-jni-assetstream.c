@@ -30,8 +30,50 @@ static const char *Str(const jobj *o) { const char *s = tl_jni_string(o); return
 
 jobj *tl_hle_assets(void);
 
-/* The layer's own InputStream over an asset (husk-tl-jni-hle.c's `stream`): the channel reads from the same state. */
-typedef struct { const uint8_t *data; size_t len, pos; uint8_t *owned; } stream;
+/* The stream itself (a tl_astream) is the native state of the InputStream and of its channel; both hold it,
+ * so it is reference counted (a channel made from a stream keeps the same bytes at the same position). */
+
+/* The stream behind every asset InputStream and channel: the APKs' entry, one window at a time. */
+struct tl_astream { tl_zip_stream *zs; int refs; };
+
+tl_astream *tl_astream_open(const char *name)
+{
+    char path[1100]; snprintf(path, sizeof(path), "assets/%s", name ? name : "");
+    for (int i = 0; ; i++) {
+        const tl_zip *z = tl_ld_apk_at(i);
+        if (!z) return NULL;
+        const tl_zip_entry *e = tl_zip_find(z, path);
+        if (!e) continue;
+        char err[160];
+        tl_zip_stream *zs = tl_zip_stream_open(z, e, (size_t)1 << 30, err, sizeof(err));
+        if (!zs) { tl_log_line("assets: %s: %s", name ? name : "?", err); return NULL; }
+        tl_astream *s = calloc(1, sizeof(*s));
+        if (!s) { tl_zip_stream_close(zs); return NULL; }
+        s->zs = zs;
+        s->refs = 1;
+        return s;
+    }
+}
+tl_astream *tl_astream_retain(tl_astream *s)
+{
+    if (s) __atomic_add_fetch(&s->refs, 1, __ATOMIC_RELAXED);
+    return s;
+}
+uint64_t tl_astream_read(tl_astream *s, void *buf, uint64_t n)
+{
+    if (!s || !n) return n ? (uint64_t)-1 : 0;
+    size_t r = tl_zip_stream_read(s->zs, buf, n > SIZE_MAX ? SIZE_MAX : (size_t)n, NULL, 0);
+    return r == (size_t)-1 ? (uint64_t)-1 : (uint64_t)r;
+}
+int64_t tl_astream_len(const tl_astream *s) { return s ? (int64_t)tl_zip_stream_len(s->zs) : -1; }
+int64_t tl_astream_pos(const tl_astream *s) { return s ? (int64_t)tl_zip_stream_pos(s->zs) : 0; }
+void tl_astream_close(tl_astream *s)
+{
+    if (!s) return;
+    if (__atomic_sub_fetch(&s->refs, 1, __ATOMIC_ACQ_REL) != 0) return;   /* a channel may still hold it */
+    tl_zip_stream_close(s->zs);
+    free(s);
+}
 
 /* The asset's place in the APK, if it is stored there uncompressed (so a file descriptor can read it in place). */
 bool tl_assetstream_stored(const char *name, int *fd, int64_t *off, int64_t *len)
@@ -131,27 +173,26 @@ jobj *tl_assetstream_file_tree(void)
 
 static void SDL_noExpansion(tl_jcall *c) { c->ret = vl(NULL); }                    /* SDLActivity.openAPKExpansionInputStream: no expansion file */
 
-/* Channels.newChannel(stream): the same asset, read through the channel's read(ByteBuffer). */
+/* Channels.newChannel(stream): the same asset, read through the channel's read(ByteBuffer); the stream is the tl_astream husk-tl-jni-hle.c's InputStream wraps. */
 static void CH_newChannel(tl_jcall *c)
 {
     jobj *s = c->args[0].l;
     if (!s || !s->native) { c->ret = vl(NULL); return; }
     jobj *ch = tl_jni_new_object(tl_jni_class(CHANNEL));
-    ch->native = s->native;
+    ch->native = tl_astream_retain(s->native);      /* the channel and the stream share it; each close gives one back */
     c->ret = vl(ch);
 }
 static void CH_read(tl_jcall *c)                                                    /* read(ByteBuffer): -1 at the end */
 {
-    stream *st = c->self ? c->self->native : NULL;
+    tl_astream *st = c->self ? c->self->native : NULL;
     jobj *bb = c->args[0].l;
     void *addr = bb ? tl_jni_get_field(bb, "address", "J").l : NULL;
     int64_t cap = bb ? tl_jni_get_field(bb, "capacity", "J").j : 0;
-    if (!st || !addr || cap <= 0 || st->pos >= st->len) { c->ret = vi(-1); return; }
-    size_t n = (size_t)cap < st->len - st->pos ? (size_t)cap : st->len - st->pos;
-    memcpy(addr, st->data + st->pos, n); st->pos += n;
-    c->ret = vi((int)n);
+    if (!st || !addr || cap <= 0) { c->ret = vi(-1); return; }
+    uint64_t r = tl_astream_read(st, addr, (uint64_t)cap);
+    c->ret = vi(r && r != (uint64_t)-1 ? (int)r : -1);
 }
-static void CH_close(tl_jcall *c) { (void)c; }
+static void CH_close(tl_jcall *c) { if (c->self && c->self->native) { tl_astream_close(c->self->native); c->self->native = NULL; } }
 
 #define M_(c, n, s, f) { c, n, s, f }
 static const tl_jhle k_hle[] = {

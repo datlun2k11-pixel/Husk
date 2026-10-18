@@ -206,14 +206,19 @@ NAT(N_readAsset)
 {
     (void)self;
     const tl_zip *z = NULL;
-    const tl_zip_entry *e = asset_find(tl_jni_string(a[0].l), &z);
+    const char *name = tl_jni_string(a[0].l);
+    const tl_zip_entry *e = asset_find(name, &z);
     if (!e) { *ret = L(NULL); return true; }
-    const uint8_t *d; size_t len; bool owned; char err[160];
-    if (!tl_zip_data(z, e, (size_t)1 << 30, &d, &len, &owned, err, sizeof(err))) { *ret = L(NULL); return true; }
+    char err[160];
+    tl_zip_stream *st = tl_zip_stream_open(z, e, (size_t)1 << 30, err, sizeof(err));
+    if (!st) { tl_log_line("assets: %s: %s", name ? name : "?", err); *ret = L(NULL); return true; }
+    /* straight into the array the app asked for: a whole asset costs one copy of itself, not two */
+    size_t len = (size_t)tl_zip_stream_len(st);
     jobj *arr = tl_jni_new_prim_array('B', (uint32_t)len);
+    size_t got = len ? tl_zip_stream_read(st, arr->arr.data, len, err, sizeof(err)) : 0;
+    tl_zip_stream_close(st);
+    if (got != len) { tl_log_line("assets: %s: %s", name ? name : "?", err); tl_jni_unref(arr); *ret = L(NULL); return true; }
     arr->refs = 1u << 30;
-    memcpy(arr->arr.data, d, len);
-    if (owned) free((void *)d);
     *ret = L(arr);
     return true;
 }
@@ -342,12 +347,15 @@ NAT(N_readApkFile)
     const tl_zip *z = apk_n(a[0].i, NULL);
     const tl_zip_entry *e = z && n ? tl_zip_find(z, n) : NULL;
     if (!e) { *ret = L(NULL); return true; }
-    const uint8_t *d; size_t len; bool owned; char err[160];
-    if (!tl_zip_data(z, e, (size_t)1 << 30, &d, &len, &owned, err, sizeof(err))) { *ret = L(NULL); return true; }
+    char err[160];
+    tl_zip_stream *st = tl_zip_stream_open(z, e, (size_t)1 << 30, err, sizeof(err));
+    if (!st) { tl_log_line("apk: %s: %s", n, err); *ret = L(NULL); return true; }
+    size_t len = (size_t)tl_zip_stream_len(st);
     jobj *arr = tl_jni_new_prim_array('B', (uint32_t)len);
+    size_t got = len ? tl_zip_stream_read(st, arr->arr.data, len, err, sizeof(err)) : 0;
+    tl_zip_stream_close(st);
+    if (got != len) { tl_log_line("apk: %s: %s", n, err); tl_jni_unref(arr); *ret = L(NULL); return true; }
     arr->refs = 1u << 30;
-    memcpy(arr->arr.data, d, len);
-    if (owned) free((void *)d);
     *ret = L(arr);
     return true;
 }

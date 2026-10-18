@@ -1083,23 +1083,27 @@ static bool extract_lib(const char *apk, const char *libname,
         snprintf(err, errlen, "%s not in the APK", entry);
         return false;
     }
-    const uint8_t *bytes;
-    size_t len;
-    bool owned;
-    if (!tl_zip_data(&z, en, 1u << 30, &bytes, &len, &owned, err, errlen)) {
+    /* inflated straight into the image buffer: one copy of the library, not two */
+    tl_zip_stream *st = tl_zip_stream_open(&z, en, 1u << 30, err, errlen);
+    if (!st) {
         tl_zip_close(&z);
         return false;
     }
+    size_t len = (size_t)tl_zip_stream_len(st);
     uint8_t *copy = malloc(len ? len : 1);
     if (!copy) {
-        if (owned) free((void *)bytes);
+        tl_zip_stream_close(st);
         tl_zip_close(&z);
         snprintf(err, errlen, "out of memory");
         return false;
     }
-    memcpy(copy, bytes, len);
-    if (owned) free((void *)bytes);
+    size_t got = len ? tl_zip_stream_read(st, copy, len, err, errlen) : 0;
+    tl_zip_stream_close(st);
     tl_zip_close(&z);
+    if (got != len) {
+        free(copy);
+        return false;
+    }
     *out = copy;
     *outlen = len;
     return true;

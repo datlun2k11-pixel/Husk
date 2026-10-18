@@ -86,6 +86,7 @@ typedef struct tl_zip {
     size_t         size;
     tl_zip_entry  *entries;
     size_t         count;
+    uint64_t       touched;   /* bytes read since the mapping was last trimmed */
 } tl_zip;
 
 /* Reads the central directory. The file stays mapped until tl_zip_close(). */
@@ -101,6 +102,42 @@ const tl_zip_entry *tl_zip_find(const tl_zip *z, const char *name);
 bool tl_zip_data(const tl_zip *z, const tl_zip_entry *e, size_t limit,
                  const uint8_t **out, size_t *out_len, bool *owned,
                  char *err, size_t errlen);
+
+/*
+ * A mapped APK holds its touched pages resident, and iOS counts them in the
+ * memory footprint it kills on. tl_zip_trim() lets go of them: they are clean
+ * file pages, so nothing is lost, and the next read faults them back from the
+ * disk (a few milliseconds). The reads here count their volume and trim when
+ * it passes a few hundred megabytes, so a game that streams its way through
+ * tens of gigabytes keeps the mapping's resident set small all along.
+ */
+void tl_zip_trim(tl_zip *z);
+
+/*
+ * An entry as a stream: it is read one small window at a time, so a deflated
+ * asset is never held whole -- a 1 GiB one opens in a quarter of a megabyte.
+ * A stored entry reads straight out of the mapping. `pos` runs over the
+ * uncompressed bytes; seeks backwards re-inflate what they skip (raw deflate
+ * has no memory). Failing paths return `(size_t)-1` for sizes and positions.
+ */
+typedef struct tl_zip_stream tl_zip_stream;
+
+/* `limit` is as in tl_zip_data(). The stream holds pointers taken from `z`,
+ * which must stay open until tl_zip_stream_close(). */
+tl_zip_stream *tl_zip_stream_open(const tl_zip *z, const tl_zip_entry *e,
+                                  size_t limit, char *err, size_t errlen);
+/* Reads up to `n` bytes at `pos`, advancing it. 0 is the end of the entry. */
+size_t tl_zip_stream_read(tl_zip_stream *s, void *buf, size_t n, char *err, size_t errlen);
+/* Read position and length, in uncompressed bytes. */
+uint64_t tl_zip_stream_pos(const tl_zip_stream *s);
+uint64_t tl_zip_stream_len(const tl_zip_stream *s);
+/* Puts the read at `at` (uncompressed bytes; behind the position means
+ * re-inflating from the top). `(uint64_t)-1` is failure. */
+uint64_t tl_zip_stream_seek(tl_zip_stream *s, uint64_t at, char *err, size_t errlen);
+/* The whole entry, from its first byte, held by the stream. The reads so far
+ * do not constrain it. A stored entry's answer points into the mapping. */
+const uint8_t *tl_zip_stream_whole(tl_zip_stream *s, char *err, size_t errlen);
+void tl_zip_stream_close(tl_zip_stream *s);
 
 /* ------------------------------------------------------------------- ELF */
 

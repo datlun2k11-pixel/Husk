@@ -288,7 +288,20 @@ static int b_AConfiguration_getSdkVersion(tl_aconfig *c) { (void)c; return 34; }
 
 /* ---------------------------------------------------------------- assets */
 
-typedef struct { const uint8_t *data; size_t len; size_t pos; uint8_t *owned; char name[400]; } tl_asset;
+/*
+ * An asset, the way AAsset hands it over. A stored one reads straight out of
+ * its APK's mapping (zero copies). A deflated one is inflated on demand, one
+ * window at a time: Android streams an asset too, and a game that opens its
+ * biggest pack holds a few hundred kilobytes of it, not the whole thing.
+ */
+typedef struct {
+    tl_zip_stream *stream;             /* a deflated entry, read on demand */
+    const uint8_t *data;               /* bytes ready at once: a stored entry points into the mapping */
+    size_t len, pos;
+    uint8_t *owned;                    /* TL_ASSET_DIR and local files' bytes */
+    bool whole;                        /* a deflated entry that `getBuffer` inflated whole */
+    char name[400];
+} tl_asset;
 
 static void *b_AAssetManager_fromJava(void *env, void *obj) { (void)env; (void)obj; static int mgr; return &mgr; }
 
@@ -322,15 +335,22 @@ static void *b_AAssetManager_open(void *mgr, const char *name, int mode)
         if (!z) break;
         const tl_zip_entry *e = tl_zip_find(z, path);
         if (!e) continue;
-        const uint8_t *data; size_t n; bool owned; char err[160];
-        if (!tl_zip_data(z, e, (size_t)2 << 30, &data, &n, &owned, err, sizeof(err))) {
+        tl_asset *a = calloc(1, sizeof(*a));
+        if (!a) return NULL;
+        snprintf(a->name, sizeof(a->name), "%s", name);
+        char err[160];
+        a->stream = tl_zip_stream_open(z, e, (size_t)2 << 30, err, sizeof(err));
+        if (!a->stream) {
+            free(a);
             tl_log_line("assets: %s: %s", name, err);
             return NULL;
         }
-        tl_asset *a = calloc(1, sizeof(*a));
-        a->data = data; a->len = n;
-        if (owned) a->owned = (uint8_t *)data;
-        snprintf(a->name, sizeof(a->name), "%s", name);
+        if (e->method == 0) {
+            /* stored: a pointer into the mapping, android-style (openFileDescriptor finds it too) */
+            a->data = tl_zip_stream_whole(a->stream, err, sizeof(err));
+            if (!a->data) { tl_zip_stream_close(a->stream); free(a); tl_log_line("assets: %s: %s", name, err); return NULL; }
+        }
+        a->len = (size_t)tl_zip_stream_len(a->stream);
         return a;
     }
     return NULL;
@@ -531,9 +551,16 @@ static const char *b_AAssetDir_getNextFileName(tl_assetdir *d) { return d && d->
 static void b_AAssetDir_close(tl_assetdir *d) { if (!d) return; for (size_t i = 0; i < d->n; i++) free(d->names[i]); free(d->names); free(d); }
 static unsigned long b_deflateBound(void *strm, unsigned long n) { (void)strm; return n + (n >> 12) + (n >> 14) + (n >> 25) + 13; }
 
-static void b_AAsset_close(tl_asset *a) { if (a) { free(a->owned); free(a); } }
+static void b_AAsset_close(tl_asset *a) { if (a) { tl_zip_stream_close(a->stream); free(a->owned); free(a); } }
 static int b_AAsset_read(tl_asset *a, void *buf, size_t n)
 {
+    if (a && !a->data && !a->whole && a->stream) {        /* deflated, not materialized: inflate as much as the caller asked for */
+        char err[160];
+        size_t r = tl_zip_stream_read(a->stream, buf, n, err, sizeof(err));
+        if (r == (size_t)-1) { tl_log_line("assets: %s: %s", a->name, err); return -1; }
+        a->pos += r;
+        return (int)r;
+    }
     size_t left = a->len - a->pos;
     if (n > left) n = left;
     memcpy(buf, a->data + a->pos, n);
@@ -542,16 +569,31 @@ static int b_AAsset_read(tl_asset *a, void *buf, size_t n)
 }
 static long b_AAsset_getLength(tl_asset *a) { return (long)a->len; }
 static long b_AAsset_getRemainingLength(tl_asset *a) { return (long)(a->len - a->pos); }
-static const void *b_AAsset_getBuffer(tl_asset *a) { return a->data; }
+static const void *b_AAsset_getBuffer(tl_asset *a)
+{
+    if (a && !a->data && a->stream && !a->whole) {        /* the game wants all of it in memory: pay the inflate now */
+        char err[160];
+        a->data = tl_zip_stream_whole(a->stream, err, sizeof(err));
+        if (!a->data) { tl_log_line("assets: %s: %s", a->name, err); return NULL; }
+        a->whole = true;
+    }
+    return a ? a->data : NULL;
+}
 static long b_AAsset_seek(tl_asset *a, long off, int whence)
 {
     long base = whence == 0 ? 0 : whence == 1 ? (long)a->pos : (long)a->len;
     long np = base + off;
-    if (np < 0 || (size_t)np > a->len) return -1;
+    if (!a || np < 0 || (size_t)np > a->len) return -1;
+    if (a->whole || !a->stream) {                          /* bytes in hand: move among them */
+        a->pos = (size_t)np;
+        return np;
+    }
+    /* Android offers no seek on a compressed asset; what is here is a re-inflate to that spot, which costs what it costs */
+    if (tl_zip_stream_seek(a->stream, (uint64_t)np, NULL, 0) == (uint64_t)-1) return -1;
     a->pos = (size_t)np;
     return np;
 }
-static int b_AAsset_isAllocated(tl_asset *a) { return a->owned != NULL; }
+static int b_AAsset_isAllocated(tl_asset *a) { return a && (a->data != NULL); }
 /* a descriptor on the APK and the asset's place in it, for an asset stored uncompressed; -1 for a compressed one (as Android does) */
 bool tl_assetstream_stored(const char *name, int *fd, int64_t *off, int64_t *len);
 static int b_AAsset_openFileDescriptor64(tl_asset *a, int64_t *start, int64_t *len)

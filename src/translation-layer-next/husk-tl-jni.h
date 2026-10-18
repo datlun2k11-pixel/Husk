@@ -101,6 +101,18 @@ jvalue tl_jni_get_static(const char *cls, const char *name, const char *sig);
 /* An iterator over a fixed list of objects, for the Java collections implemented in C (each item gets a new reference as it is returned). */
 jobj *tl_jni_new_list_iterator(jobj *const *items, uint32_t n);
 
+/* A game asset as a Java-style stream (AssetManager.open, the NDK's AAsset
+ * over the same APK), swollen on demand: a deflated asset is never in memory
+ * whole. Shared by husk-tl-jni-hle.c (InputStream) and husk-tl-jni-assetstream.c
+ * (ReadableByteChannel), as those two see the same object. */
+typedef struct tl_astream tl_astream;
+tl_astream *tl_astream_open(const char *name);                       /* the APKs' assets/<name>, or NULL */
+tl_astream *tl_astream_retain(tl_astream *s);                        /* one more holder (a channel of that stream) */
+uint64_t tl_astream_read(tl_astream *s, void *buf, uint64_t n);      /* bytes read; 0 is the asset's end; (uint64_t)-1 is damage */
+int64_t  tl_astream_len(const tl_astream *s);                        /* the asset's size, in bytes */
+int64_t  tl_astream_pos(const tl_astream *s);
+void     tl_astream_close(tl_astream *s);                            /* one holder lets go; the last one frees the bytes */
+
 /* Exceptions */
 void tl_jni_throw(const char *cls, const char *msg);
 bool tl_jni_pending(void);

@@ -413,18 +413,27 @@ static const char *jar_inflated(const jar_entry *j, char *buf, size_t n)
     snprintf(buf, n, "%s/%s", dir, name);
     struct stat st;
     if (stat(buf, &st) == 0 && (uint64_t)st.st_size == j->size) return buf;
+    /* streamed to the file: a jar entry of any size costs a megabyte of buffer, and the zip stays under the
+     * lock for the whole of it (g_jar_zip is closed and reopened when another APK is asked for) */
     pthread_mutex_lock(&g_jar_lock);
     const tl_zip_entry *e = tl_zip_find(&g_jar_zip, j->entry);
-    const uint8_t *data = NULL; size_t len = 0; bool owned = false; char err[160];
-    bool ok = e && tl_zip_data(&g_jar_zip, e, 1u << 30, &data, &len, &owned, err, sizeof(err));
-    pthread_mutex_unlock(&g_jar_lock);
-    if (!ok) return NULL;
+    char err[160];
+    tl_zip_stream *stream = e ? tl_zip_stream_open(&g_jar_zip, e, 1u << 30, err, sizeof(err)) : NULL;
+    if (!stream) { pthread_mutex_unlock(&g_jar_lock); return NULL; }
     char tmp[1200];
     snprintf(tmp, sizeof(tmp), "%s.part", buf);
     FILE *f = fopen(tmp, "wb");
-    bool wrote = f && fwrite(data, 1, len, f) == len;
+    bool wrote = f != NULL;
+    uint8_t chunk[64 << 10];                   /* on the stack: a thread here may have a 512 KiB one */
+    while (wrote) {
+        size_t r = tl_zip_stream_read(stream, chunk, sizeof(chunk), err, sizeof(err));
+        if (r == (size_t)-1) { wrote = false; break; }
+        if (!r) break;
+        if (fwrite(chunk, 1, r, f) != r) wrote = false;
+    }
     if (f) fclose(f);
-    if (owned) free((void *)data);
+    tl_zip_stream_close(stream);
+    pthread_mutex_unlock(&g_jar_lock);
     if (!wrote || rename(tmp, buf) != 0) { unlink(tmp); return NULL; }
     return buf;
 }

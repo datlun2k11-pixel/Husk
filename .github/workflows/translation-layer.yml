@@ -1,0 +1,44 @@
+name: translation layer
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The zip layer is plain C over zlib, and its streaming test runs anywhere:
+  # it builds an archive, streams a 256 MiB deflated entry out of it byte by
+  # byte, and checks that the run never holds the entry in memory.
+  zip-layer:
+    name: asset streaming (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - name: zlib and zip
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev zip
+      - name: build
+        run: |
+          clang -g -O1 -Wall -Wextra \
+            -I src/translation-layer -I src/translation-layer-next \
+            tools/zipstream-test.c src/translation-layer/husk-tl-zip.c \
+            -lz -o zipstream-test
+      - name: run
+        run: ./zipstream-test
+
+  # macos-14 runs on arm64, which is what the layer's inline assembly and JIT
+  # substrate need: building the harness compiles and links every source of the
+  # translation layer, and the binary is the streaming test again.
+  layer-harness:
+    name: the layer builds and links (arm64)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: build the harness and run the asset-streaming test
+        run: |
+          bash tools/regress/build.sh tools/zipstream-test.c "$RUNNER_TEMP/zipstream-test"
+          "$RUNNER_TEMP/zipstream-test"

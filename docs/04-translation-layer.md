@@ -160,6 +160,35 @@ Google Play has required 16 KiB-compatible native code in new apps and updates
 that target Android 15 or later, so current APKs from Play come out clean. Older ones show up as
 "needs work", and the fix is write emulation for those few pages.
 
+### An asset is streamed, not loaded: measured on the Mac
+
+A game's biggest files live in its APK (or in an install-time asset pack, which
+is another APK), and the early translation layer inflated every one of them
+whole the moment the game opened it, held them on the heap, and left every APK
+mapped with nothing given back — the footprint of a game's asset reads looked
+like the game itself. On a 3 GB phone that alone is an out-of-memory kill at
+startup. Three things answer it:
+
+- an entry is read as a stream (`tl_zip_stream_*`): a deflated one is inflated
+  a 512 KiB window ahead of the read, so a 1 GiB pack opens in a quarter of a
+  megabyte, and a stored one reads straight out of the mapping;
+- `AAssetManager_open`/`AssetManager.open` (and `AAsset_read`,
+  `openFileDescriptor`, the channel, the InputStream, `Scanner`) hand back that
+  stream. As on Android, a stored entry is the mapping's own bytes
+  (`AAsset_isAllocated` is true, `openFileDescriptor` works) and a compressed
+  one is *not* held; `AAsset_getBuffer` is what materialises one whole, exactly
+  when the game asks for that;
+- reads count the bytes they put under iOS's eyes, and each APK's mapping gives
+  its pages back with `madvise(MADV_DONTNEED)` once 128 MiB have been served
+  (`TL_ZIP_TRIM_MB`, 0 to never trim). The mappings' hot pages — the central
+  directory, a manifest just read — fault back in from the file for
+  milliseconds. The loader trims too, after each library it has carved into JIT
+  memory.
+
+`tools/zipstream-test.c` streams a 256 MiB deflated entry and checks its bytes
+byte for byte at random offsets; the run's peak memory stays under 32 MiB,
+where the old whole-inflating read needed 257 MiB.
+
 ### The thread register: measured on the phone
 
 Clang's Android target reads the stack-protector cookie from

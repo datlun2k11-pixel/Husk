@@ -663,24 +663,16 @@ static void SB_setLength(tl_jcall *c) { sbuf *b = sb_of(c->self); if (c->args[0]
 
 /* ------------------------------------------ assets, streams, Scanner */
 
-typedef struct { const uint8_t *data; size_t len, pos; uint8_t *owned; } stream;
+/* An asset's InputStream reads a tl_astream's windowed bytes (an entry of the APKs, read one piece at a time),
+ * and husk-tl-jni-assetstream.c's channel sees the same object: the stream itself is the native state. */
 
 static jobj *open_asset(const char *name)
 {
-    char path[1100]; snprintf(path, sizeof(path), "assets/%s", name);
-    for (int i = 0;; i++) {
-        const tl_zip *z = tl_ld_apk_at(i);
-        if (!z) return NULL;
-        const tl_zip_entry *e = tl_zip_find(z, path);
-        if (!e) continue;
-        const uint8_t *d; size_t n; bool owned; char err[160];
-        if (!tl_zip_data(z, e, (size_t)1 << 30, &d, &n, &owned, err, sizeof(err))) return NULL;
-        jobj *s = make("java/io/ByteArrayInputStream");
-        stream *st = calloc(1, sizeof(*st));
-        st->data = d; st->len = n; if (owned) st->owned = (uint8_t *)d;
-        s->native = st;
-        return s;
-    }
+    tl_astream *as = tl_astream_open(name);
+    if (!as) return NULL;
+    jobj *s = make("java/io/ByteArrayInputStream");
+    s->native = as;
+    return s;
 }
 static void AM_open(tl_jcall *c)
 {
@@ -688,36 +680,52 @@ static void AM_open(tl_jcall *c)
     if (!s) { tl_jni_throw("java/io/FileNotFoundException", S(c->args[0].l)); c->ret = vl(NULL); return; }
     c->ret = vl(s);
 }
-static void IS_read0(tl_jcall *c) { stream *s = c->self->native; c->ret = vi(s && s->pos < s->len ? s->data[s->pos++] : -1); }
+static void IS_read0(tl_jcall *c)
+{
+    tl_astream *s = c->self->native; uint8_t b = 0;
+    if (!s || tl_astream_read(s, &b, 1) != 1) { c->ret = vi(-1); return; }
+    c->ret = vi((int)b);
+}
 static void IS_read_arr(tl_jcall *c)
 {
-    stream *s = c->self->native; jobj *a = c->args[0].l;
-    if (!s || !a || s->pos >= s->len) { c->ret = vi(-1); return; }
-    size_t n = a->arr.len < s->len - s->pos ? a->arr.len : s->len - s->pos;
-    memcpy(a->arr.data, s->data + s->pos, n); s->pos += n; c->ret = vi((int)n);
+    tl_astream *s = c->self->native; jobj *a = c->args[0].l;
+    if (!s || !a || !a->arr.len) { c->ret = vi(-1); return; }
+    uint64_t r = tl_astream_read(s, a->arr.data, a->arr.len);
+    c->ret = vi(r && r != (uint64_t)-1 ? (int)r : -1);
 }
 static void IS_read_range(tl_jcall *c)
 {
-    stream *s = c->self->native; jobj *a = c->args[0].l; int off = c->args[1].i, len = c->args[2].i;
-    if (!s || !a || s->pos >= s->len || off < 0 || len < 0 || (uint32_t)(off + len) > a->arr.len) { c->ret = vi(-1); return; }
-    size_t n = (size_t)len < s->len - s->pos ? (size_t)len : s->len - s->pos;
-    memcpy((char *)a->arr.data + off, s->data + s->pos, n); s->pos += n; c->ret = vi((int)n);
+    tl_astream *s = c->self->native; jobj *a = c->args[0].l; int off = c->args[1].i, len = c->args[2].i;
+    if (!s || !a || len < 0 || off < 0 || (uint32_t)off + (uint32_t)len > a->arr.len) { c->ret = vi(-1); return; }
+    if (!len) { c->ret = vi(0); return; }
+    uint64_t r = tl_astream_read(s, (char *)a->arr.data + off, (uint64_t)len);
+    c->ret = vi(r && r != (uint64_t)-1 ? (int)r : -1);
 }
-static void IS_available(tl_jcall *c) { stream *s = c->self->native; c->ret = vi(s ? (int)(s->len - s->pos) : 0); }
-static void IS_close(tl_jcall *c) { (void)c; }
+static void IS_available(tl_jcall *c)
+{
+    tl_astream *s = c->self->native;
+    int64_t left = s ? tl_astream_len(s) - tl_astream_pos(s) : 0;
+    c->ret = vi(left <= 0 ? 0 : left <= 0x7fffffff ? (int)left : 0x7fffffff);
+}
+/* closes the stream for good, as a ByteArrayInputStream's close does */
+static void IS_close(tl_jcall *c) { if (c->self && c->self->native) { tl_astream_close(c->self->native); c->self->native = NULL; } }
 static void Scanner_init(tl_jcall *c) { tl_jni_set_field(c->self, "stream", "Ljava/io/InputStream;", vl(tl_jni_ref(c->args[0].l))); }
 static void Scanner_useDelimiter(tl_jcall *c) { c->ret = vl(tl_jni_ref(c->self)); }
 static void Scanner_hasNext(tl_jcall *c)
 {
-    jobj *in = tl_jni_get_field(c->self, "stream", "Ljava/io/InputStream;").l; stream *s = in ? in->native : NULL;
-    c->ret = vz(s && s->pos < s->len);
+    jobj *in = tl_jni_get_field(c->self, "stream", "Ljava/io/InputStream;").l; tl_astream *s = in ? in->native : NULL;
+    c->ret = vz(s && tl_astream_pos(s) < tl_astream_len(s));
 }
 static void Scanner_next(tl_jcall *c)
 {
-    jobj *in = tl_jni_get_field(c->self, "stream", "Ljava/io/InputStream;").l; stream *s = in ? in->native : NULL;
-    if (!s || s->pos >= s->len) { tl_jni_throw("java/util/NoSuchElementException", ""); c->ret = vl(NULL); return; }
-    char *t = malloc(s->len - s->pos + 1); memcpy(t, s->data + s->pos, s->len - s->pos); t[s->len - s->pos] = 0;
-    s->pos = s->len; c->ret = vl(STR(t)); free(t);
+    jobj *in = tl_jni_get_field(c->self, "stream", "Ljava/io/InputStream;").l; tl_astream *s = in ? in->native : NULL;
+    int64_t rest = s ? tl_astream_len(s) - tl_astream_pos(s) : 0;
+    if (!s || rest <= 0) { tl_jni_throw("java/util/NoSuchElementException", ""); c->ret = vl(NULL); return; }
+    char *t = malloc((size_t)rest + 1);
+    if (!t || tl_astream_read(s, t, (uint64_t)rest) != (uint64_t)rest) { free(t); tl_jni_throw("java/util/NoSuchElementException", ""); c->ret = vl(NULL); return; }
+    t[rest] = 0;
+    c->ret = vl(STR(t));
+    free(t);
 }
 
 /* ------------------------------------------- collections, services, misc */
