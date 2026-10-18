@@ -39,6 +39,10 @@ jobs:
   # NET_RT_DUMP, res_ninit), so it is built and run here: the run checks the reading is coherent -- the address parses,
   # the netmask is one with the prefix it reports, the broadcast and the router are on the same network, and the way the
   # address is packed is the way Android's own APIs take it. A machine with nothing up still passes: the reading says so.
+  # The run itself is built twice: once as it builds here, and once with -DHUSK_HAVE_ROUTE_H=0, which is the position an
+  # iOS build is in -- the iOS SDK ships no net/route.h, and a sandboxed app is given no routing table -- so that half of
+  # the file is compiled on every push and not only on a device. TL_NETCFG_NO_ROUTES=1 puts the reading in that position
+  # at run time, where the router is worked out from the resolvers or the network instead, and that rule is checked too.
   network-bridge:
     name: network bridge (macos)
     runs-on: macos-14
@@ -50,11 +54,18 @@ jobs:
             -I src/translation-layer -I src/translation-layer-next \
             tools/netcfg-test.c src/translation-layer-next/husk-tl-netcfg.c \
             -lresolv -o netcfg-test
+          # The same with no routing table: what the iOS SDK gives a build there (see HUSK_HAVE_ROUTE_H).
+          clang -g -O1 -Wall -Wextra -D_DEFAULT_SOURCE -DHUSK_HAVE_ROUTE_H=0 \
+            -I src/translation-layer -I src/translation-layer-next \
+            tools/netcfg-test.c src/translation-layer-next/husk-tl-netcfg.c \
+            -lresolv -o netcfg-test-ios
       - name: run
         run: |
-          ./netcfg-test                  # the switch's own default
-          TL_NET_BRIDGE=1 ./netcfg-test  # as if Settings had turned it on
-          TL_NET_BRIDGE=0 ./netcfg-test  # as if Settings had turned it off
+          ./netcfg-test                    # the switch's own default
+          TL_NET_BRIDGE=1 ./netcfg-test    # as if Settings had turned it on
+          TL_NET_BRIDGE=0 ./netcfg-test    # as if Settings had turned it off
+          ./netcfg-test-ios                # built the way an iOS build is: no routing table at all
+          TL_NETCFG_NO_ROUTES=1 ./netcfg-test  # the same reading, with the table there but not read
 
   # macos-14 runs on arm64, which is what the layer's inline assembly, its JIT
   # calls and Darwin's thread-state structs need: an Intel machine cannot even

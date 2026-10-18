@@ -3,6 +3,8 @@
  * The network bridge's reading (husk-tl-netcfg.c), on the machine running the test: which interface it picks, what it
  * reports, and that what it reports is coherent -- the address parses, the netmask is one, the prefix matches it, the
  * broadcast is on the same network, and Android's own packing of the address (the first octet in the low byte) is right.
+ * With TL_NETCFG_NO_ROUTES=1 it reads the way an iOS build has to (no net/route.h there, and no routing table for a
+ * sandboxed app), and the router it works out instead is checked too.
  *
  * A machine with no network at all still passes: nothing is up, and the reading says so.
  */
@@ -42,6 +44,22 @@ static bool same_network(const char *ip, const char *mask, const char *peer)
     if (!parses(ip) || !parses(mask) || !parses(peer)) return false;
     inet_pton(AF_INET, ip, &a); inet_pton(AF_INET, mask, &m); inet_pton(AF_INET, peer, &b);
     return (a.s_addr & m.s_addr) == (b.s_addr & m.s_addr);
+}
+
+/* The router the reading should work out with no routing table to read (the way an iOS build has to), the same rule
+   husk-tl-netcfg.c uses: a resolver on our own network if there is one, else the first address of the network. */
+static void expected_router(const tl_netcfg *c, char *out, size_t n)
+{
+    out[0] = 0;
+    if (c->ndns > 0 && same_network(c->ip, c->netmask, c->dns[0])) { snprintf(out, n, "%s", c->dns[0]); return; }
+    if (c->prefix > 0 && c->prefix < 31 && parses(c->netmask) && parses(c->ip)) {
+        struct in_addr a, m, g;
+        inet_pton(AF_INET, c->ip, &a); inet_pton(AF_INET, c->netmask, &m);
+        g.s_addr = htonl((ntohl(a.s_addr) & ntohl(m.s_addr)) | 1u);
+        inet_ntop(AF_INET, &g, out, (socklen_t)n);
+        return;
+    }
+    if (c->ndns > 0) snprintf(out, n, "%s", c->dns[0]);
 }
 
 int main(void)
@@ -87,6 +105,16 @@ int main(void)
     check(!tl_netcfg_if_hidden(c.ifname), "the interface it chose is not one of the host's own", c.ifname);
     check(tl_netcfg_if_hidden("utun3") && tl_netcfg_if_hidden("awdl0") && !tl_netcfg_if_hidden("en0"),
           "a VPN's tunnel is hidden and Wi-Fi is not", "");
+
+    /* iOS ships no net/route.h and gives a sandboxed app no routing table, so there the router is worked out from what
+       else is readable: TL_NETCFG_NO_ROUTES, and the binary built with -DHUSK_HAVE_ROUTE_H=0, run that way here. */
+    bool no_routes = !tl_netcfg_has_routes();
+    printf("routing table: %s\n", no_routes ? "not read (as on iOS)" : "read");
+    if (no_routes) {
+        char want[64];
+        expected_router(&c, want, sizeof(want));
+        check(want[0] && !strcmp(c.gateway, want), "the router is worked out without a routing table", c.gateway);
+    }
 
     char host[32], android[16];
     check(tl_netcfg_primary(host, sizeof(host), android, sizeof(android)) && !strcmp(host, c.ifname) && !strcmp(android, c.android_if),

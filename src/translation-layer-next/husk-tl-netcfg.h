@@ -44,7 +44,9 @@ typedef struct tl_netcfg {
 } tl_netcfg;
 
 /* The host's configuration right now, cached for TL_NETCFG_TTL_S. False (with `why` filled) when there is nothing to
-   report -- no interface is up. `out` may be NULL to ask only whether it is available. */
+   report -- no interface is up. `out` may be NULL to ask only whether it is available. The router is the default route's
+   gateway where the routing table can be read (macOS), and the resolver, or the network's first address, where it cannot
+   be (iOS). */
 bool tl_netcfg_read(tl_netcfg *out);
 
 /* The phone's resolvers, as text, for code that resolves names itself (net.dns1, c-ares, ...). Falls back to public
@@ -72,6 +74,11 @@ uint32_t tl_netcfg_addr_int(const char *ipv4);
    Android would give it ("wlan0", "rmnet0", "eth0"). Both answer false/zero when nothing is up. */
 bool tl_netcfg_if_hidden(const char *name);
 bool tl_netcfg_primary(char *host_name, size_t n, char *android_name, size_t m);
+
+/* Whether the router was read from the kernel's routing table. It is not on iOS, whose SDK ships no net/route.h and
+   gives a sandboxed app no routing table, so there the router is worked out from the resolvers or the network instead;
+   TL_NETCFG_NO_ROUTES=1 reads that way on a machine that does have the table. */
+bool tl_netcfg_has_routes(void);
 
 #ifdef __cplusplus
 }

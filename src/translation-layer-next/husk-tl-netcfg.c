@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * The phone's own network configuration (husk-tl-netcfg.h): read with getifaddrs, the routing table and the system
- * resolver, and handed back as the IPv4 addresses Android's APIs use. Nothing here needs an entitlement that a
- * sideloaded app does not have: the interface addresses and the resolvers are the app's own.
+ * The phone's own network configuration (husk-tl-netcfg.h): read with getifaddrs, the kernel's routing table (where the
+ * SDK has one -- iOS's has none, and no routing table is given to a sandboxed app, so the router comes from the resolvers
+ * or from the network itself there) and the system resolver, and handed back as the IPv4 addresses Android's APIs use.
+ * Nothing here needs an entitlement that a sideloaded app does not have: the interface addresses and the resolvers are
+ * the app's own.
  */
 #define _DARWIN_C_SOURCE
 #include "husk-tl-netcfg.h"
@@ -12,7 +14,17 @@
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <net/if_dl.h>
+/* The routing table, where the SDK has one: iOS does not ship net/route.h, and a sandboxed app is not given the table
+   there, so the router comes from the rest of the reading (fill_gateway). -DHUSK_HAVE_ROUTE_H=0 compiles the way iOS
+   builds, which the workflow does, so that half of the file is compiled on every push and not only on a device. */
+#ifndef HUSK_HAVE_ROUTE_H
+#if __has_include(<net/route.h>)
 #include <net/route.h>
+#define HUSK_HAVE_ROUTE_H 1
+#else
+#define HUSK_HAVE_ROUTE_H 0
+#endif
+#endif
 #include <pthread.h>
 #include <resolv.h>
 #include <stdio.h>
@@ -165,9 +177,27 @@ static bool read_config(tl_netcfg *c)
     return true;
 }
 
-/* The router: the gateway of the IPv4 default route out of this interface, from the kernel's routing table. */
-static bool read_gateway(const char *ifname, char *out, size_t n)
+/* Whether this build reads the kernel's routing table for the router here: false when the SDK ships none (iOS), and on
+   TL_NETCFG_NO_ROUTES=1, which is how the reading is tested where the table does exist. */
+bool tl_netcfg_has_routes(void)
 {
+#if HUSK_HAVE_ROUTE_H
+    const char *e = getenv("TL_NETCFG_NO_ROUTES");
+    return !(e && e[0] == '1');
+#else
+    return false;
+#endif
+}
+
+/* The router: the gateway of the IPv4 default route out of this interface, from the kernel's routing table.
+ *
+ * Only where the platform has one to read. The iOS SDK has no net/route.h at all -- a sandboxed app is not given the
+ * routing table -- so there the router is worked out from the rest of the reading instead (fill_gateway). The rest of the
+ * configuration (the address, the netmask, the broadcast address, the MAC, the resolvers) is the app's own on either. */
+static bool gateway_from_routes(const char *ifname, char *out, size_t n)
+{
+    if (!tl_netcfg_has_routes()) { (void)ifname; (void)out; (void)n; return false; }
+#if HUSK_HAVE_ROUTE_H
     int mib[6] = { CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_DUMP, 0 };
     size_t len = 0;
     if (sysctl(mib, 6, NULL, &len, NULL, 0) != 0 || len < sizeof(struct rt_msghdr)) return false;
@@ -206,6 +236,41 @@ static bool read_gateway(const char *ifname, char *out, size_t n)
     }
     free(buf);
     return found;
+#else
+    (void)ifname; (void)out; (void)n;
+    return false;
+#endif
+}
+
+/* Whether two addresses are on the network a netmask leaves. */
+static bool same_net(const char *a, const char *b, const char *mask)
+{
+    struct in_addr x, y, m;
+    if (inet_pton(AF_INET, a, &x) != 1 || inet_pton(AF_INET, b, &y) != 1 || inet_pton(AF_INET, mask, &m) != 1) return false;
+    return (x.s_addr & m.s_addr) == (y.s_addr & m.s_addr);
+}
+
+/* The first address of our network (192.168.1.1 for 192.168.1.42/24): where a router almost always is. */
+static bool subnet_router(tl_netcfg *c)
+{
+    struct in_addr ip, mask, g;
+    if (c->prefix <= 0 || c->prefix >= 31) return false;
+    if (inet_pton(AF_INET, c->ip, &ip) != 1 || inet_pton(AF_INET, c->netmask, &mask) != 1) return false;
+    g.s_addr = htonl((ntohl(ip.s_addr) & ntohl(mask.s_addr)) | 1u);
+    return inet_ntop(AF_INET, &g, c->gateway, sizeof(c->gateway)) != NULL;
+}
+
+/* The router of the network we are on, from what can be read here. */
+static void fill_gateway(tl_netcfg *c)
+{
+    if (gateway_from_routes(c->ifname, c->gateway, sizeof(c->gateway))) return;
+    /* No routing table to read (iOS), or no default route in it. On a home network the router is the resolver, so a
+       resolver on our own network is taken as it; otherwise the first address of the network is, which is where a router
+       almost always is, and which keeps the answer on the network either way. */
+    if (c->ndns > 0 && same_net(c->dns[0], c->ip, c->netmask)) { snprintf(c->gateway, sizeof(c->gateway), "%s", c->dns[0]); return; }
+    if (subnet_router(c)) return;
+    if (c->ndns > 0) { snprintf(c->gateway, sizeof(c->gateway), "%s", c->dns[0]); return; }
+    snprintf(c->why, sizeof(c->why), "no default route to report");
 }
 
 /* ------------------------------------------------------------------ resolvers */
@@ -245,16 +310,11 @@ static bool fill(tl_netcfg *c)
 {
     memset(c, 0, sizeof(*c));
     if (!read_config(c)) return false;
-    if (!read_gateway(c->ifname, c->gateway, sizeof(c->gateway)))
-        snprintf(c->why, sizeof(c->why), "the routing table gave no default route");
-    c->gateway_int = tl_netcfg_addr_int(c->gateway);
     c->ndns = tl_dns_servers(c->dns, TL_NETCFG_MAX_DNS);
     for (int i = 0; i < c->ndns; i++) c->dns_int[i] = tl_netcfg_addr_int(c->dns[i]);
-    /* A home router is usually the DNS server too, and DhcpInfo's serverAddress should not be 0. */
-    if (!c->gateway[0] && c->ndns > 0) {
-        snprintf(c->gateway, sizeof(c->gateway), "%s", c->dns[0]);
-        c->gateway_int = c->dns_int[0];
-    }
+    /* After the resolvers: where the routing table cannot be read, one of them is the router. */
+    fill_gateway(c);
+    c->gateway_int = tl_netcfg_addr_int(c->gateway);
     c->ok = true;
     return true;
 }
