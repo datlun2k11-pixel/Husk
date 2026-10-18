@@ -103,13 +103,28 @@ jobs:
         run: ./scripts/ci_build.sh build/Husk.ipa
         timeout-minutes: 300
 
+      # The artifact goes up before the check below, not after: a check that fails
+      # on its own plumbing should not be what decides whether a built IPA can be
+      # downloaded.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Husk-ipa
+          path: |
+            build/Husk.ipa
+            build/Husk.tipa
+          if-no-files-found: error
+          retention-days: 14
+
       - name: the IPA carries the fix and the runtime
         run: |
           set -euo pipefail
           unzip -q build/Husk.ipa -d "$RUNNER_TEMP/out"
           APP="$RUNNER_TEMP/out/Payload/Husk.app"
           # The streamed asset read is this branch's; no other Husk binary has this.
-          strings "$APP/Husk" | grep -q TL_ZIP_TRIM_MB
+          # Into a file: grep -q closes the pipe on its first match, and strings
+          # then exits non-zero with "failed to flush output".
+          strings -a "$APP/Husk" > "$RUNNER_TEMP/husk.strings"
+          grep -q TL_ZIP_TRIM_MB "$RUNNER_TEMP/husk.strings"
           # Without these the app installs, launches, and then cannot start a game.
           test -f "$APP/java-runtime/husk-framework.dex"
           test -f "$APP/java-runtime/framework-res.apk"
@@ -120,12 +135,3 @@ jobs:
           plutil -p "$APP/Info.plist" | grep -E "HuskBuildCommit|CFBundleShortVersionString"
           du -sh "$APP"
           echo "built from $(git rev-parse --short HEAD)"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Husk-ipa
-          path: |
-            build/Husk.ipa
-            build/Husk.tipa
-          if-no-files-found: error
-          retention-days: 14
