@@ -8,11 +8,10 @@ name: build IPA
 #   gh run watch $(gh run list --workflow "build IPA" -L1 --json databaseId -q '.[0].databaseId')
 #   gh run download --name Husk-ipa --dir ~/Desktop
 #
-# The build is the repository's own ./scripts/ci_build.sh -- QEMU, ANGLE, MoltenVK,
-# the guest kernel and the app -- which takes about an hour from a cold runner.
-# Two things it cannot do are added around it, see the steps below: the Android
-# files it normally takes from a Lineage system image, and Husk's Java framework
-# dex rebuilt from this checkout.
+# The build is the repository's own ./scripts/ci_build.sh -- QEMU, ANGLE,
+# virglrenderer, MoltenVK, the guest kernel and the app, an hour or so from a
+# cold runner. Three things the repository cannot build are staged before it,
+# from the published Husk.ipa; see the step for why each one.
 on:
   workflow_dispatch:
 
@@ -48,43 +47,61 @@ jobs:
       - name: tools the build scripts call
         run: |
           xcodebuild -version
-          brew install meson xcodegen
+          # qemu-img: the app's own build phase makes the firmware and userdata
+          # seeds with it and stops with an error when it is missing.
+          brew install meson xcodegen qemu
+          # virglrenderer's meson build asks for a python3 with PyYAML, and the
+          # meson the GPU script runs is Homebrew's, so Homebrew's python3 needs it.
+          PY=/opt/homebrew/bin/python3
+          "$PY" -m ensurepip --default-pip >/dev/null 2>&1 || true
+          "$PY" -m pip install --break-system-packages --quiet pyyaml \
+            || "$PY" -m pip install --quiet pyyaml
+          "$PY" -c 'import yaml; print("pyyaml", yaml.__version__)'
+          # libhusk_rppairing.a, the on-device pairing library for StikJIT.
           rustup target add aarch64-apple-ios
           meson --version; ninja --version; xcodegen --version; cargo --version
+          command -v qemu-img
 
-      - name: QEMU, ANGLE, MoltenVK, the guest kernel and the app
-        run: ./scripts/ci_build.sh "$RUNNER_TEMP/Husk-check.ipa"
-        timeout-minutes: 300
-
-      - name: the Android files the repository does not carry
+      - name: the pieces the repository cannot build
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # build/java-runtime (libcore, ICU, conscrypt, tzdata, framework-res.apk)
-          # and build/android-system (fonts, certificates) are taken from a Lineage
-          # system image, which no script here can fetch; the project itself only
-          # warns when they are missing, and the app then starts no game at all.
-          # The published Husk.ipa carries them, and Android's own files do not
-          # depend on the Husk commit.
+          # Three things ./scripts/ci_build.sh cannot produce, all of them from
+          # sources or trees that are not here. They come from the published
+          # Husk.ipa: none of them is code this branch changed, and naming them
+          # is better than an IPA that builds, installs and then starts nothing.
+          #
+          #   java-runtime   build_java_runtime.sh wants the /apex directory of a
+          #                  Lineage system image (Android's libcore, ICU,
+          #                  conscrypt, tzdata, framework-res.apk). Without it no
+          #                  game starts: the Dalvik runtime has no classes.
+          #   android-system build_android_system.sh wants the same image (system
+          #                  fonts, the trusted certificates).
+          #   libhuskps4     build_ps4_ios.sh builds it from two working trees on
+          #                  the author's Mac (Bachata-S4 on branch husk, husk-fex
+          #                  on branch husk-fex), neither of which is a repository
+          #                  this can clone. The PS4 layer, not the phone's own.
           gh release download --repo Leviidev/Husk --pattern Husk.ipa \
             --dir "$RUNNER_TEMP/rel" --clobber
           unzip -q "$RUNNER_TEMP/rel/Husk.ipa" -d "$RUNNER_TEMP/rel/x"
           APP="$RUNNER_TEMP/rel/x/Payload/Husk.app"
           rsync -a --delete "$APP/java-runtime/" build/java-runtime/
           rsync -a --delete "$APP/android-system/" build/android-system/
-          # Husk's Java framework is rebuilt here instead, so the dex inside the app
-          # is this checkout's (package_ipa.sh refuses to package a mismatched one).
+          mkdir -p build/ios-arm64/lib
+          cp "$APP/Frameworks/libhuskps4.dylib" build/ios-arm64/lib/
+          # Husk's own Java framework is the one exception: it is rebuilt from this
+          # checkout, so the dex the app carries and the native side it talks to are
+          # the same commit (package_ipa.sh refuses to package a mismatched one).
           curl -fsL -o "$RUNNER_TEMP/r8.jar" \
             https://storage.googleapis.com/r8-releases/raw/8.7.18/r8.jar
           HUSK_JDK="$(/usr/libexec/java_home)" HUSK_D8="$RUNNER_TEMP/r8.jar" \
             ./src/java-framework/build.sh build/java-runtime/husk-framework.dex
+          ls -dh build/java-runtime build/android-system build/ios-arm64/lib/libhuskps4.dylib
 
-      - name: package the IPA
-        run: |
-          ./scripts/package_ipa.sh build/Husk.ipa
-          ./scripts/package_ipa.sh --trollstore build/Husk.tipa
-          ls -lh build/Husk.ipa build/Husk.tipa
+      - name: QEMU, ANGLE, virglrenderer, MoltenVK, the guest kernel and the app
+        run: ./scripts/ci_build.sh build/Husk.ipa
+        timeout-minutes: 300
 
       - name: the IPA carries the fix and the runtime
         run: |
