@@ -66,6 +66,16 @@ Games see Google Play services as installed and signed out, so the ones that
 check for it start normally; Play Games sign-in, cloud saves and purchases are
 not available. Geometry Dash can load [Geode](https://geode-sdk.org) mods.
 
+For LAN multiplayer, turn on **Settings › Network Bridge**. A game is then told
+the iPhone's own address, netmask, router and DNS — what its DHCP lease gave it —
+instead of the empty values it used to see, and the game has to be started again
+to notice. Sockets already run on the iPhone's network, so the address a game
+announces with the bridge on is the address its packets really come from. One
+part of LAN play stays out of reach on iOS: receiving broadcast or multicast
+needs Apple's `com.apple.developer.networking.multicast` entitlement, which a
+sideloaded build does not have. Joining a game by typing the host's address,
+and unicast in both directions, work.
+
 An APK needs 64-bit (`arm64-v8a`) native code. iPhones cannot run 32-bit ARM
 code, so an APK that only has 32-bit libraries cannot run here. APKs and
 split bundles (`.xapk`, `.apkm`, `.apks`, or a Play download's separate split

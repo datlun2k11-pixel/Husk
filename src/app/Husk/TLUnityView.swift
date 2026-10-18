@@ -281,6 +281,8 @@ final class TLUnityUIView: UIView, UIKeyInput {
             husk_native_set_system_files(sys + "/cacerts", sys)
         }
         husk_native_set_extra_fonts(CJKFonts.directory.path)
+        // Settings > Network Bridge: whether Android's network APIs answer with the iPhone's own address, DNS and router.
+        NetworkBridge.apply()
         let started: Bool
         switch engine {
         case .sdl:

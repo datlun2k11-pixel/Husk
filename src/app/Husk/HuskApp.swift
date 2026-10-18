@@ -81,6 +81,9 @@ struct HuskApp: App {
         // Copies of shared APKs that were never placed.
         IncomingFiles.clearLeftovers()
 
+        // The Translation Layer's network bridge (Settings > Network Bridge), as the app last left it.
+        NetworkBridge.apply()
+
         // Game controllers, for the games the native runtime runs.
         Task { @MainActor in HuskGamepads.shared.start() }
     }

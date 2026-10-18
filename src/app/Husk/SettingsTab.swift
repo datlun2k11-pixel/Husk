@@ -85,6 +85,16 @@ struct SettingsTab: View {
                 }
 
                 Section {
+                    row(NetworkBridgeSettings(), "network", .blue, "Network Bridge",
+                        "Let games see the iPhone's address and DNS (LAN play)")
+                } header: {
+                    Text("Translation Layer")
+                } footer: {
+                    Text("Games the Translation Layer runs share the iPhone's network. With the bridge on, a game that asks "
+                       + "Android for its address is told the phone's own, which is what LAN multiplayer needs.")
+                }
+
+                Section {
                     row(AndroidSystemPage(), "apps.iphone", AndroidMark.green, "Android", "Experimental: full Android in an emulator")
                     row(InputSettings(), "hand.tap.fill", .indigo, "Input", "Screen, touch, keyboard")
                     row(NetworkSettings(), "globe", .green, "Network", "Internet and saved sessions")

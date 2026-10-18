@@ -23,6 +23,12 @@ public final class Native {
     public static native String dataDir();
     public static native String externalDir();
     public static native String packageName();
+    /**
+     * The phone's own network, with Settings &gt; Network Bridge on: the host interface, what Android calls it, the
+     * address, its netmask, the prefix length, the router, the broadcast address, the MAC, then up to four resolvers --
+     * as text, in that order. Empty when the bridge is off, or when the phone has no network up (husk-tl-netcfg.c).
+     */
+    public static native String[] networkConfig();
     public static native int screenWidth();
     public static native int screenHeight();
     public static native float density();

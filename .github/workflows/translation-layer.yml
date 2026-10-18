@@ -34,6 +34,28 @@ jobs:
           ./zipstream-test                     # the archive mapped whole
           TL_ZIP_MAP_MAX_MB=0 ./zipstream-test # every read a pread
 
+  # The network bridge reads the phone's own configuration -- the up interface, its netmask and broadcast address, the
+  # MAC, the IPv4 default route out of it, and the resolvers. It is Darwin's own API (getifaddrs, the routing table
+  # NET_RT_DUMP, res_ninit), so it is built and run here: the run checks the reading is coherent -- the address parses,
+  # the netmask is one with the prefix it reports, the broadcast and the router are on the same network, and the way the
+  # address is packed is the way Android's own APIs take it. A machine with nothing up still passes: the reading says so.
+  network-bridge:
+    name: network bridge (macos)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: |
+          clang -g -O1 -Wall -Wextra -D_DEFAULT_SOURCE \
+            -I src/translation-layer -I src/translation-layer-next \
+            tools/netcfg-test.c src/translation-layer-next/husk-tl-netcfg.c \
+            -lresolv -o netcfg-test
+      - name: run
+        run: |
+          ./netcfg-test                  # the switch's own default
+          TL_NET_BRIDGE=1 ./netcfg-test  # as if Settings had turned it on
+          TL_NET_BRIDGE=0 ./netcfg-test  # as if Settings had turned it off
+
   # macos-14 runs on arm64, which is what the layer's inline assembly, its JIT
   # calls and Darwin's thread-state structs need: an Intel machine cannot even
   # compile those files. This compiles exactly what tools/regress/build.sh

@@ -24,6 +24,7 @@
 #include "husk-tl-egl.h"
 #include "husk-tl-internal.h"
 #include "husk-tl-ld.h"
+#include "husk-tl-netcfg.h"
 
 void tl_nwindow_configure(int w, int h, void *layer);
 void *tl_nwindow_get(void);
@@ -340,6 +341,24 @@ NAT(N_splitPaths)
     *ret = L(arr);
     return true;
 }
+NAT(N_networkConfig)
+{
+    (void)self; (void)a;
+    /* Settings > Network Bridge off, or nothing up: an empty array, which the framework reads as "as before". */
+    tl_netcfg c;
+    if (!tl_netcfg_bridge() || !tl_netcfg_read(&c)) { *ret = L(NULL); return true; }
+    tl_netcfg_note();
+    char prefix[16];
+    snprintf(prefix, sizeof(prefix), "%d", c.prefix);
+    const char *v[12] = { c.ifname, c.android_if, c.ip, c.netmask, prefix, c.gateway, c.broadcast, c.mac,
+                          c.dns[0], c.ndns > 1 ? c.dns[1] : "", c.ndns > 2 ? c.dns[2] : "", c.ndns > 3 ? c.dns[3] : "" };
+    jobj *arr = tl_jni_new_obj_array(tl_jni_class("java/lang/String"), 12);
+    arr->cls = tl_jni_class("[Ljava/lang/String;");
+    arr->refs = 1u << 30;
+    for (int i = 0; i < 12; i++) arr->oarr.v[i] = jstr(v[i]);
+    *ret = L(arr);
+    return true;
+}
 NAT(N_readApkFile)
 {
     (void)self;
@@ -478,6 +497,7 @@ static const struct { const char *name, *sig; dvm_native_fn fn; } k_native[] = {
     { "dataDir", "()Ljava/lang/String;", N_dataDir },
     { "externalDir", "()Ljava/lang/String;", N_externalDir },
     { "packageName", "()Ljava/lang/String;", N_packageName },
+    { "networkConfig", "()[Ljava/lang/String;", N_networkConfig },
     { "screenWidth", "()I", N_screenWidth },
     { "screenHeight", "()I", N_screenHeight },
     { "density", "()F", N_density },

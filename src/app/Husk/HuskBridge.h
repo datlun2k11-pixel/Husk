@@ -111,5 +111,7 @@ void husk_balloon_set_bytes(int64_t target_bytes);
 #include "../../translation-layer/husk-tl.h"
 #include "../../translation-layer-next/husk-tl-unity-app.h"
 #include "../../translation-layer-next/husk-console-host.h"
+/* Settings > Network Bridge: the phone's own network, told to the guest (husk-tl-netcfg.c). */
+#include "../../translation-layer-next/husk-tl-netcfg.h"
 
 #endif /* HUSK_BRIDGE_H */

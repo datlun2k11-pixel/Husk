@@ -670,6 +670,8 @@ final class TLAttemptRunner: ObservableObject {
     /// `seconds` of 0 is no limit: the run goes on until it is stopped. It used to stop itself after two minutes.
     func start(apks: [String], seconds: Int = 0) {
         guard !isRunning else { return }
+        // Settings > Network Bridge, before the run: what Android's network APIs will answer with.
+        NetworkBridge.apply()
         isRunning = true
         isDone = false
         exitCode = nil

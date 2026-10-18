@@ -17,6 +17,7 @@
 
 #include "husk-tl-bionic.h"
 #include "husk-tl-http.h"
+#include "husk-tl-netcfg.h"
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <resolv.h>
@@ -193,51 +194,276 @@ static void NI_typeName(tl_jcall *c) { c->ret = vl(tl_jni_new_string("WIFI")); }
 static void NI_subtype(tl_jcall *c) { c->ret = vi(0); }
 
 /*
- * The DNS servers the phone uses, as text, for code that resolves names itself rather than through getaddrinfo: c-ares (in
- * Geode 5's curl, and others) asks Android for them through ConnectivityManager -> LinkProperties.getDnsServers(), and
- * failing that reads net.dns1/net.dns2. Without an answer it has no servers and every request fails with "couldn't resolve
- * host". The system's own resolver configuration is read once; public resolvers stand behind it.
+ * The DNS servers the phone uses come from husk-tl-netcfg.c (tl_dns_servers): code that resolves names itself rather than
+ * through getaddrinfo -- c-ares in Geode 5's curl, and others -- asks Android for them here through
+ * ConnectivityManager -> LinkProperties.getDnsServers(), and failing that reads net.dns1/net.dns2. Without an answer it
+ * has no servers and every request fails with "couldn't resolve host".
  */
-int tl_dns_servers(char out[][64], int max)
-{
-    int n = 0;
-    struct __res_state st;
-    memset(&st, 0, sizeof(st));
-    if (res_ninit(&st) == 0) {
-        union res_sockaddr_union addrs[8];
-        int got = res_getservers(&st, addrs, 8);
-        for (int i = 0; i < got && n < max; i++) {
-            if (addrs[i].sin.sin_family == AF_INET) inet_ntop(AF_INET, &addrs[i].sin.sin_addr, out[n], 64);
-            else if (addrs[i].sin6.sin6_family == AF_INET6) inet_ntop(AF_INET6, &addrs[i].sin6.sin6_addr, out[n], 64);
-            else continue;
-            if (out[n][0]) n++;
-        }
-        res_ndestroy(&st);
-    }
-    static const char *fallback[] = { "1.1.1.1", "8.8.8.8" };
-    for (int i = 0; i < 2 && n < max; i++) snprintf(out[n++], 64, "%s", fallback[i]);
-    return n;
-}
 
 static void CM_linkProperties(tl_jcall *c) { c->ret = vl(tl_jni_new_object(tl_jni_class("android/net/LinkProperties"))); }
 typedef struct { jobj **items; uint32_t n; } alist;      /* the ArrayList the gamepad code answers size()/get() for */
+static jobj *Net_list(jobj **items, uint32_t n)
+{
+    jobj *l = tl_jni_new_object(tl_jni_class("java/util/ArrayList"));
+    alist *a = calloc(1, sizeof(*a));
+    a->items = items; a->n = n;
+    l->native = a;
+    return l;
+}
 static void LP_dnsServers(tl_jcall *c)
 {
     char servers[6][64];
     int n = tl_dns_servers(servers, 6);
-    jobj *l = tl_jni_new_object(tl_jni_class("java/util/ArrayList"));
-    alist *a = calloc(1, sizeof(*a));
-    a->items = calloc((size_t)n, sizeof(jobj *));
+    jobj **items = calloc((size_t)(n > 0 ? n : 1), sizeof(jobj *));
+    uint32_t have = 0;
     for (int i = 0; i < n; i++) {
         jobj *ia = tl_jni_new_object(tl_jni_class("java/net/InetAddress"));
         jvalue v; v.j = 0; v.l = tl_jni_new_string(servers[i]);
         tl_jni_set_field(ia, "host", "Ljava/lang/String;", v);
-        a->items[a->n++] = ia;
+        items[have++] = ia;
     }
-    l->native = a;
-    c->ret = vl(l);
+    c->ret = vl(Net_list(items, have));
 }
 static void IA_hostAddress(tl_jcall *c) { c->ret = tl_jni_get_field(c->self, "host", "Ljava/lang/String;"); }
+
+/* ---------------------------------------------------------------- the bridge */
+
+/*
+ * Settings > Network Bridge (husk-tl-netcfg.c): with it on, a game that asks Android about its network is told what the
+ * phone's own Wi-Fi really is -- the address, netmask, router and DNS the iPhone's DHCP lease gave it. The game's sockets
+ * already go out on the host's stack, so this is the address its packets come from, and a LAN game told anything else
+ * announces itself somewhere nothing can reach it. With the bridge off these answer the placeholders they always did, and
+ * the log says once which question was asked, so a game whose LAN mode does not work can be pointed at the switch.
+ */
+static bool net_bridge(const char *what, tl_netcfg *cfg)
+{
+    if (!tl_netcfg_bridge()) {
+        char n[192]; snprintf(n, sizeof(n), "net: %s was asked, but the bridge is off (Settings > Network Bridge)", what);
+        tl_note_once(n);
+        return false;
+    }
+    if (!tl_netcfg_read(cfg)) {
+        char n[192]; snprintf(n, sizeof(n), "net: %s was asked, but the phone has no network (%s)", what, cfg->why);
+        tl_note_once(n);
+        return false;
+    }
+    tl_netcfg_note();
+    return true;
+}
+static void nset_i(jobj *o, const char *f, int v) { jvalue x; x.j = 0; x.i = v; tl_jni_set_field(o, f, "I", x); }
+static void nset_s(jobj *o, const char *f, const char *v)
+{
+    jvalue x; x.j = 0; x.l = v ? tl_jni_new_string(v) : NULL;
+    tl_jni_set_field(o, f, "Ljava/lang/String;", x);
+}
+static jobj *Net_inet(const char *ipv4)
+{
+    jobj *o = tl_jni_new_object(tl_jni_class("java/net/InetAddress"));
+    nset_s(o, "host", ipv4);
+    return o;
+}
+
+/* WifiManager/WifiInfo: what Android's Wi-Fi connection info would say. */
+static void WM_getConnectionInfo(tl_jcall *c)
+{
+    jobj *w = tl_jni_new_object(tl_jni_class("android/net/wifi/WifiInfo"));
+    /* What an app without the location permission sees on Android, and what Husk answered before the bridge. */
+    nset_s(w, "SSID", "<unknown ssid>"); nset_i(w, "NetworkId", -1); nset_i(w, "Rssi", -55); nset_i(w, "LinkSpeed", 433);
+    nset_i(w, "Frequency", 2412); nset_i(w, "IpAddress", 0);
+    nset_s(w, "BSSID", "02:00:00:00:00:00"); nset_s(w, "MacAddress", "02:00:00:00:00:00");
+    tl_netcfg cfg;
+    if (net_bridge("WifiManager.getConnectionInfo", &cfg)) {
+        nset_i(w, "IpAddress", (int)cfg.ip_int);
+        if (cfg.mac[0]) { nset_s(w, "MacAddress", cfg.mac); nset_s(w, "BSSID", cfg.mac); }
+        /* the private names, for a game that reads the fields rather than the getters */
+        nset_i(w, "mIpAddress", (int)cfg.ip_int);
+        if (cfg.mac[0]) nset_s(w, "mMacAddress", cfg.mac);
+    }
+    c->ret = vl(w);
+}
+static void WM_getDhcpInfo(tl_jcall *c)
+{
+    jobj *d = tl_jni_new_object(tl_jni_class("android/net/DhcpInfo"));
+    tl_netcfg cfg;
+    if (net_bridge("WifiManager.getDhcpInfo", &cfg)) {
+        nset_i(d, "ipAddress", (int)cfg.ip_int);
+        nset_i(d, "gateway", (int)cfg.gateway_int);
+        nset_i(d, "netmask", (int)cfg.netmask_int);
+        nset_i(d, "dns1", (int)(cfg.ndns > 0 ? cfg.dns_int[0] : 0));
+        nset_i(d, "dns2", (int)(cfg.ndns > 1 ? cfg.dns_int[1] : 0));
+        nset_i(d, "serverAddress", (int)cfg.gateway_int);            /* the router is the DHCP server on any home LAN */
+        nset_i(d, "leaseDuration", 86400);
+    }
+    c->ret = vl(d);
+}
+static void WM_isWifiEnabled(tl_jcall *c)
+{
+    tl_netcfg cfg;
+    c->ret = vz(net_bridge("WifiManager.isWifiEnabled", &cfg));
+}
+static void WM_getWifiState(tl_jcall *c)
+{
+    tl_netcfg cfg;
+    c->ret = vi(net_bridge("WifiManager.getWifiState", &cfg) ? 3 : 0);      /* 3: WIFI_STATE_ENABLED */
+}
+static void WI_getIpAddress(tl_jcall *c)
+{
+    tl_netcfg cfg;
+    c->ret = vi(net_bridge("WifiInfo.getIpAddress", &cfg) ? (int)cfg.ip_int : 0);
+}
+static void WI_getMacAddress(tl_jcall *c)
+{
+    tl_netcfg cfg;
+    c->ret = vl(tl_jni_new_string(net_bridge("WifiInfo.getMacAddress", &cfg) && cfg.mac[0] ? cfg.mac : "02:00:00:00:00:00"));
+}
+static void WI_getBSSID(tl_jcall *c)
+{
+    tl_netcfg cfg;
+    c->ret = vl(tl_jni_new_string(net_bridge("WifiInfo.getBSSID", &cfg) && cfg.mac[0] ? cfg.mac : "02:00:00:00:00:00"));
+}
+static void WI_getSSID(tl_jcall *c) { c->ret = vl(tl_jni_new_string("<unknown ssid>")); }
+static void WI_getLinkSpeed(tl_jcall *c) { c->ret = vi(433); }
+static void WI_getFrequency(tl_jcall *c) { c->ret = vi(2412); }
+static void WI_getNetworkId(tl_jcall *c) { c->ret = vi(-1); }
+static void WI_getRssi(tl_jcall *c) { c->ret = vi(-55); }
+
+/* LinkProperties: the address on the link, its netmask as a prefix, and the default route through the router. */
+static void LP_getInterfaceName(tl_jcall *c)
+{
+    tl_netcfg cfg;
+    c->ret = vl(net_bridge("LinkProperties.getInterfaceName", &cfg) ? tl_jni_new_string(cfg.android_if) : NULL);
+}
+static void LP_getLinkAddresses(tl_jcall *c)
+{
+    tl_netcfg cfg;
+    if (!net_bridge("LinkProperties.getLinkAddresses", &cfg)) { c->ret = vl(Net_list(NULL, 0)); return; }
+    jobj **items = calloc(1, sizeof(jobj *));
+    jobj *la = tl_jni_new_object(tl_jni_class("android/net/LinkAddress"));
+    nset_i(la, "prefixLength", cfg.prefix);
+    tl_jni_set_field(la, "address", "Ljava/net/InetAddress;", vl(Net_inet(cfg.ip)));
+    items[0] = la;
+    c->ret = vl(Net_list(items, 1));
+}
+static void LA_getAddress(tl_jcall *c) { c->ret = tl_jni_get_field(c->self, "address", "Ljava/net/InetAddress;"); }
+static void LA_getPrefixLength(tl_jcall *c) { c->ret = tl_jni_get_field(c->self, "prefixLength", "I"); }
+static void LP_getRoutes(tl_jcall *c)
+{
+    tl_netcfg cfg;
+    if (!net_bridge("LinkProperties.getRoutes", &cfg)) { c->ret = vl(Net_list(NULL, 0)); return; }
+    jobj **items = calloc(1, sizeof(jobj *));
+    jobj *r = tl_jni_new_object(tl_jni_class("android/net/RouteInfo"));
+    nset_s(r, "iface", cfg.android_if);
+    if (cfg.gateway[0]) tl_jni_set_field(r, "gateway", "Ljava/net/InetAddress;", vl(Net_inet(cfg.gateway)));
+    items[0] = r;
+    c->ret = vl(Net_list(items, 1));
+}
+static void RI_getGateway(tl_jcall *c) { c->ret = tl_jni_get_field(c->self, "gateway", "Ljava/net/InetAddress;"); }
+static void RI_getInterface(tl_jcall *c) { c->ret = tl_jni_get_field(c->self, "iface", "Ljava/lang/String;"); }
+/* java.net.NetworkInterface: the same interface once more, for a game that walks the list rather than reading
+ * LinkProperties, and for the InetAddress java.net code asks the local address from. Android's loopback is not among
+ * them here (a game that skips it finds the phone's own interface first). */
+static jobj *NetIF_one(const tl_netcfg *cfg)
+{
+    jobj *n = tl_jni_new_object(tl_jni_class("java/net/NetworkInterface"));
+    nset_s(n, "name", cfg->android_if);
+    nset_s(n, "displayName", cfg->android_if);
+    tl_jni_set_field(n, "addr", "Ljava/net/InetAddress;", vl(Net_inet(cfg->ip)));
+    tl_jni_set_field(n, "bcast", "Ljava/net/InetAddress;", vl(Net_inet(cfg->broadcast)));
+    nset_i(n, "prefix", cfg->prefix);
+    return n;
+}
+static void NetIF_getNetworkInterfaces(tl_jcall *c)
+{
+    tl_netcfg cfg;
+    if (!net_bridge("NetworkInterface.getNetworkInterfaces", &cfg) || !cfg.ip[0]) { c->ret = vl(Net_list(NULL, 0)); return; }
+    jobj **items = calloc(1, sizeof(jobj *));
+    items[0] = NetIF_one(&cfg);
+    c->ret = vl(Net_list(items, 1));
+}
+static void NetIF_getByName(tl_jcall *c)      /* also getByIndex / getByInetAddress: the same one */
+{
+    tl_netcfg cfg;
+    if (!net_bridge("NetworkInterface.getByName", &cfg) || !cfg.ip[0]) { c->ret = vl(NULL); return; }
+    c->ret = vl(NetIF_one(&cfg));
+}
+static void NetIF_getName(tl_jcall *c) { c->ret = tl_jni_get_field(c->self, "name", "Ljava/lang/String;"); }
+static void NetIF_getDisplayName(tl_jcall *c) { c->ret = tl_jni_get_field(c->self, "displayName", "Ljava/lang/String;"); }
+static void NetIF_getInetAddresses(tl_jcall *c)
+{
+    tl_netcfg cfg;
+    if (!net_bridge("NetworkInterface.getInetAddresses", &cfg) || !cfg.ip[0]) { c->ret = vl(Net_list(NULL, 0)); return; }
+    jobj **items = calloc(1, sizeof(jobj *));
+    items[0] = Net_inet(cfg.ip);
+    c->ret = vl(Net_list(items, 1));
+}
+static void NetIF_getInterfaceAddresses(tl_jcall *c)
+{
+    tl_netcfg cfg;
+    if (!net_bridge("NetworkInterface.getInterfaceAddresses", &cfg) || !cfg.ip[0]) { c->ret = vl(Net_list(NULL, 0)); return; }
+    jobj **items = calloc(1, sizeof(jobj *));
+    jobj *a = tl_jni_new_object(tl_jni_class("java/net/InterfaceAddress"));
+    tl_jni_set_field(a, "address", "Ljava/net/InetAddress;", vl(Net_inet(cfg.ip)));
+    if (cfg.broadcast[0]) tl_jni_set_field(a, "broadcast", "Ljava/net/InetAddress;", vl(Net_inet(cfg.broadcast)));
+    nset_i(a, "prefix", cfg.prefix);
+    items[0] = a;
+    c->ret = vl(Net_list(items, 1));
+}
+static void NetIF_getHardwareAddress(tl_jcall *c)
+{
+    tl_netcfg cfg;
+    if (!net_bridge("NetworkInterface.getHardwareAddress", &cfg) || !cfg.mac[0]) { c->ret = vl(NULL); return; }
+    unsigned b[6];
+    if (sscanf(cfg.mac, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) { c->ret = vl(NULL); return; }
+    jobj *arr = tl_jni_new_prim_array('B', 6);
+    arr->refs = 1u << 30;
+    for (int i = 0; i < 6; i++) ((uint8_t *)arr->arr.data)[i] = (uint8_t)b[i];
+    c->ret = vl(arr);
+}
+static void NetIF_isUp(tl_jcall *c) { tl_netcfg cfg; c->ret = vz(net_bridge("NetworkInterface.isUp", &cfg)); }
+static void NetIF_isLoopback(tl_jcall *c) { (void)c; c->ret = vz(0); }
+static void NetIF_isPointToPoint(tl_jcall *c) { (void)c; c->ret = vz(0); }
+static void NetIF_isVirtual(tl_jcall *c) { (void)c; c->ret = vz(0); }
+static void NetIF_supportsMulticast(tl_jcall *c) { (void)c; c->ret = vz(1); }
+static void NetIF_getMTU(tl_jcall *c) { (void)c; c->ret = vi(1500); }
+static void NetIF_getIndex(tl_jcall *c) { (void)c; c->ret = vi(1); }
+static void IA2_getAddress(tl_jcall *c) { c->ret = tl_jni_get_field(c->self, "address", "Ljava/net/InetAddress;"); }
+static void IA2_getBroadcast(tl_jcall *c) { c->ret = tl_jni_get_field(c->self, "broadcast", "Ljava/net/InetAddress;"); }
+static void IA2_getNetworkPrefixLength(tl_jcall *c) { c->ret = tl_jni_get_field(c->self, "prefix", "I"); }
+/* InetAddress: the address we handed out is a literal, so its bytes (and its name) are its own text. */
+static void Inet_getAddress(tl_jcall *c)
+{
+    jvalue s = tl_jni_get_field(c->self, "host", "Ljava/lang/String;");
+    const char *ip = s.l ? tl_jni_string(s.l) : NULL;
+    unsigned b[4];
+    if (!ip || sscanf(ip, "%u.%u.%u.%u", &b[0], &b[1], &b[2], &b[3]) != 4) { c->ret = vl(NULL); return; }
+    jobj *arr = tl_jni_new_prim_array('B', 4);
+    arr->refs = 1u << 30;
+    for (int i = 0; i < 4; i++) ((uint8_t *)arr->arr.data)[i] = (uint8_t)b[i];
+    c->ret = vl(arr);
+}
+static void Inet_getHostName(tl_jcall *c) { c->ret = tl_jni_get_field(c->self, "host", "Ljava/lang/String;"); }
+static void Inet_isLoopbackAddress(tl_jcall *c) { (void)c; c->ret = vz(0); }
+static void Inet_isAnyLocalAddress(tl_jcall *c) { (void)c; c->ret = vz(0); }
+static void Inet_getLoopbackAddress(tl_jcall *c) { (void)c; c->ret = vl(Net_inet("127.0.0.1")); }
+
+/* Enumeration: how java.net.NetworkInterface hands its list out (getNetworkInterfaces/getInetAddresses), and how the
+ * usual loop over them asks for each one. The same list objects answer the List API as well. */
+static void Enum_hasMoreElements(tl_jcall *c)
+{
+    alist *a = c->self ? c->self->native : NULL;
+    c->ret = vz(a && tl_jni_get_field(c->self, "cursor", "I").i < (int)a->n);
+}
+static void Enum_nextElement(tl_jcall *c)
+{
+    alist *a = c->self ? c->self->native : NULL;
+    int i = c->self ? tl_jni_get_field(c->self, "cursor", "I").i : 0;
+    if (!a || i < 0 || i >= (int)a->n) { tl_jni_throw("java/util/NoSuchElementException", ""); c->ret = vl(NULL); return; }
+    nset_i(c->self, "cursor", i + 1);
+    c->ret = vl(a->items[i]);
+}
+
+static void LP_getDomains(tl_jcall *c) { c->ret = vl(NULL); }
+static void LP_getMtu(tl_jcall *c) { c->ret = vi(1500); }
 
 /* The phone has its network, as far as a game asking Android about it can tell: one active connection, over Wi-Fi, that is up. */
 static const tl_jhle k_net[] = {
@@ -251,7 +477,56 @@ static const tl_jhle k_net[] = {
     M_("android/net/NetworkCapabilities", "hasCapability", "(I)Z", True_), M_("android/net/NetworkCapabilities", "hasTransport", "(I)Z", True_),
     M_("android/net/ConnectivityManager", "getLinkProperties", "(Landroid/net/Network;)Landroid/net/LinkProperties;", CM_linkProperties),
     M_("android/net/LinkProperties", "getDnsServers", "()Ljava/util/List;", LP_dnsServers),
+    M_("android/net/LinkProperties", "getInterfaceName", "()Ljava/lang/String;", LP_getInterfaceName),
+    M_("android/net/LinkProperties", "getLinkAddresses", "()Ljava/util/List;", LP_getLinkAddresses),
+    M_("android/net/LinkProperties", "getRoutes", "()Ljava/util/List;", LP_getRoutes),
+    M_("android/net/LinkProperties", "getDomains", "()Ljava/lang/String;", LP_getDomains),
+    M_("android/net/LinkProperties", "getMtu", "()I", LP_getMtu),
+    M_("android/net/LinkAddress", "getAddress", "()Ljava/net/InetAddress;", LA_getAddress),
+    M_("android/net/LinkAddress", "getPrefixLength", "()I", LA_getPrefixLength),
+    M_("android/net/RouteInfo", "getGateway", "()Ljava/net/InetAddress;", RI_getGateway),
+    M_("android/net/RouteInfo", "getInterface", "()Ljava/lang/String;", RI_getInterface),
+    M_("android/net/RouteInfo", "isDefaultRoute", "()Z", True_),
+    M_("android/net/wifi/WifiManager", "getConnectionInfo", "()Landroid/net/wifi/WifiInfo;", WM_getConnectionInfo),
+    M_("android/net/wifi/WifiManager", "getDhcpInfo", "()Landroid/net/DhcpInfo;", WM_getDhcpInfo),
+    M_("android/net/wifi/WifiManager", "isWifiEnabled", "()Z", WM_isWifiEnabled),
+    M_("android/net/wifi/WifiManager", "getWifiState", "()I", WM_getWifiState),
+    M_("android/net/wifi/WifiInfo", "getIpAddress", "()I", WI_getIpAddress),
+    M_("android/net/wifi/WifiInfo", "getMacAddress", "()Ljava/lang/String;", WI_getMacAddress),
+    M_("android/net/wifi/WifiInfo", "getBSSID", "()Ljava/lang/String;", WI_getBSSID),
+    M_("android/net/wifi/WifiInfo", "getSSID", "()Ljava/lang/String;", WI_getSSID),
+    M_("android/net/wifi/WifiInfo", "getLinkSpeed", "()I", WI_getLinkSpeed),
+    M_("android/net/wifi/WifiInfo", "getFrequency", "()I", WI_getFrequency),
+    M_("android/net/wifi/WifiInfo", "getNetworkId", "()I", WI_getNetworkId),
+    M_("android/net/wifi/WifiInfo", "getRssi", "()I", WI_getRssi),
     M_("java/net/InetAddress", "getHostAddress", "()Ljava/lang/String;", IA_hostAddress),
+    M_("java/net/InetAddress", "getAddress", "()[B", Inet_getAddress),
+    M_("java/net/InetAddress", "getHostName", "()Ljava/lang/String;", Inet_getHostName),
+    M_("java/net/InetAddress", "getCanonicalHostName", "()Ljava/lang/String;", Inet_getHostName),
+    M_("java/net/InetAddress", "isLoopbackAddress", "()Z", Inet_isLoopbackAddress),
+    M_("java/net/InetAddress", "isAnyLocalAddress", "()Z", Inet_isAnyLocalAddress),
+    M_("java/net/InetAddress", "getLoopbackAddress", "()Ljava/net/InetAddress;", Inet_getLoopbackAddress),
+    M_("java/net/NetworkInterface", "getNetworkInterfaces", "()Ljava/util/Enumeration;", NetIF_getNetworkInterfaces),
+    M_("java/net/NetworkInterface", "getByName", "(Ljava/lang/String;)Ljava/net/NetworkInterface;", NetIF_getByName),
+    M_("java/net/NetworkInterface", "getByIndex", "(I)Ljava/net/NetworkInterface;", NetIF_getByName),
+    M_("java/net/NetworkInterface", "getByInetAddress", "(Ljava/net/InetAddress;)Ljava/net/NetworkInterface;", NetIF_getByName),
+    M_("java/net/NetworkInterface", "getName", "()Ljava/lang/String;", NetIF_getName),
+    M_("java/net/NetworkInterface", "getDisplayName", "()Ljava/lang/String;", NetIF_getDisplayName),
+    M_("java/net/NetworkInterface", "getInetAddresses", "()Ljava/util/Enumeration;", NetIF_getInetAddresses),
+    M_("java/net/NetworkInterface", "getInterfaceAddresses", "()Ljava/util/List;", NetIF_getInterfaceAddresses),
+    M_("java/net/NetworkInterface", "getHardwareAddress", "()[B", NetIF_getHardwareAddress),
+    M_("java/net/NetworkInterface", "isUp", "()Z", NetIF_isUp),
+    M_("java/net/NetworkInterface", "isLoopback", "()Z", NetIF_isLoopback),
+    M_("java/net/NetworkInterface", "isPointToPoint", "()Z", NetIF_isPointToPoint),
+    M_("java/net/NetworkInterface", "isVirtual", "()Z", NetIF_isVirtual),
+    M_("java/net/NetworkInterface", "supportsMulticast", "()Z", NetIF_supportsMulticast),
+    M_("java/net/NetworkInterface", "getMTU", "()I", NetIF_getMTU),
+    M_("java/net/NetworkInterface", "getIndex", "()I", NetIF_getIndex),
+    M_("java/net/InterfaceAddress", "getAddress", "()Ljava/net/InetAddress;", IA2_getAddress),
+    M_("java/net/InterfaceAddress", "getBroadcast", "()Ljava/net/InetAddress;", IA2_getBroadcast),
+    M_("java/net/InterfaceAddress", "getNetworkPrefixLength", "()S", IA2_getNetworkPrefixLength),
+    M_("java/util/Enumeration", "hasMoreElements", "()Z", Enum_hasMoreElements),
+    M_("java/util/Enumeration", "nextElement", "()Ljava/lang/Object;", Enum_nextElement),
     { NULL, NULL, NULL, NULL }
 };
 
@@ -399,6 +674,10 @@ void tl_http_install(void)
     tl_jni_declare("android/net/NetworkInfo", "java/lang/Object"); tl_jni_declare("android/net/Network", "java/lang/Object");
     tl_jni_declare("android/net/LinkProperties", "java/lang/Object"); tl_jni_declare("java/net/InetAddress", "java/lang/Object");
     tl_jni_declare("android/net/NetworkCapabilities", "java/lang/Object");
+    /* The bridge's own classes: what Settings > Network Bridge answers with (husk-tl-netcfg.c). */
+    tl_jni_declare("android/net/LinkAddress", "java/lang/Object"); tl_jni_declare("android/net/RouteInfo", "java/lang/Object");
+    tl_jni_declare("android/net/wifi/WifiManager", "java/lang/Object"); tl_jni_declare("android/net/wifi/WifiInfo", "java/lang/Object");
+    tl_jni_declare("android/net/DhcpInfo", "java/lang/Object");
     tl_jni_register_hle(k_net);
     tl_jni_declare("com/xbox/httpclient/HttpClientRequest", "java/lang/Object"); tl_jni_declare("com/xbox/httpclient/HttpClientResponse", "java/lang/Object");
     tl_jni_declare("com/xbox/httpclient/HttpClientRequestBody$NativeInputStream", "java/lang/Object"); tl_jni_declare("com/xbox/httpclient/HttpClientResponse$NativeOutputStream", "java/lang/Object");

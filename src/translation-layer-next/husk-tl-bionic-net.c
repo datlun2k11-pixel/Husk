@@ -13,6 +13,7 @@
  */
 #define _DARWIN_C_SOURCE
 #include "husk-tl-bionic.h"
+#include "husk-tl-netcfg.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -572,14 +573,26 @@ static int b_getifaddrs(guest_ifaddrs **out)
 {
     struct ifaddrs *list;
     if (getifaddrs(&list) != 0) { tl_set_guest_errno(tl_errno_to_guest(errno)); return -1; }
+    /* With the bridge on (Settings > Network Bridge), the guest sees an Android-shaped list: Apple's own interfaces
+     * (AWDL, a VPN's tunnels, the hotspot bridge, the low latency WLAN) are not there, the phone's Wi-Fi is called wlan0
+     * and loopback lo. Off, the host's names are passed through as before. */
+    bool bridge = tl_netcfg_bridge();
+    char primary[24] = "", android_if[16] = "";
+    if (bridge) tl_netcfg_primary(primary, sizeof(primary), android_if, sizeof(android_if));
     guest_ifaddrs *head = NULL, **tail = &head;
     for (struct ifaddrs *i = list; i; i = i->ifa_next) {
         if (!i->ifa_addr || (i->ifa_addr->sa_family != AF_INET && i->ifa_addr->sa_family != AF_INET6)) continue;
-        size_t nl = strlen(i->ifa_name) + 1;
+        if (bridge && tl_netcfg_if_hidden(i->ifa_name)) continue;
+        const char *name = i->ifa_name;
+        if (bridge) {
+            if (primary[0] && !strcmp(name, primary)) name = android_if;
+            else if (!strcmp(name, "lo0")) name = "lo";
+        }
+        size_t nl = strlen(name) + 1;
         uint8_t *blk = calloc(1, sizeof(guest_ifaddrs) + 3 * 32 + nl);
         guest_ifaddrs *g = (guest_ifaddrs *)blk;
         uint8_t *sa = blk + sizeof(guest_ifaddrs);
-        g->name = (char *)(sa + 96); memcpy(g->name, i->ifa_name, nl);
+        g->name = (char *)(sa + 96); memcpy(g->name, name, nl);
         uint32_t f = i->ifa_flags & 0x3FF & ~0x20u;
         if (i->ifa_flags & IFF_MULTICAST) f |= 0x1000;
         g->flags = f;

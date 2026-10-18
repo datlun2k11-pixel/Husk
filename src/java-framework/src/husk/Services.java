@@ -77,6 +77,8 @@ public final class Services {
         case Context.POWER_SERVICE: return new android.os.PowerManager();
         case Context.ACTIVITY_SERVICE: return new android.app.ActivityManager();
         case Context.CONNECTIVITY_SERVICE: return new android.net.ConnectivityManager();
+        /* Wi-Fi: Husk's own, which reports the phone's address and DHCP lease when the network bridge is on. */
+        case Context.WIFI_SERVICE: return new android.net.wifi.HuskWifi();
         case Context.NOTIFICATION_SERVICE: return new android.app.NotificationManager();
         case Context.ALARM_SERVICE: return new android.app.AlarmManager();
         case Context.ACCESSIBILITY_SERVICE: return new android.view.accessibility.AccessibilityManager();
