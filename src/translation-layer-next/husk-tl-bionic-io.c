@@ -384,9 +384,8 @@ static bool jar_lookup(const char *p, jar_entry *out)
         if (tl_zip_open(&g_jar_zip, out->apk, err, sizeof(err))) snprintf(g_jar_apk, sizeof(g_jar_apk), "%s", out->apk);
     }
     const tl_zip_entry *e = g_jar_apk[0] ? tl_zip_find(&g_jar_zip, out->entry) : NULL;
-    if (e && e->local_offset + 30 <= g_jar_zip.size) {
-        const uint8_t *l = g_jar_zip.map + e->local_offset;
-        uint64_t data = e->local_offset + 30ull + (uint64_t)(l[26] | (l[27] << 8)) + (uint64_t)(l[28] | (l[29] << 8));
+    uint64_t data = 0;
+    if (e && tl_zip_data_offset(&g_jar_zip, e, &data, NULL, 0)) {
         out->found = true; out->off = data; out->size = e->usize; out->method = e->method;
     } else if (g_jar_apk[0]) {
         /* No entry by that name: a folder, if any entry lies under it (zips seldom list folders themselves). */
@@ -1143,6 +1142,111 @@ static size_t phantom_clamp(uintptr_t a, size_t l)
     return l;
 }
 
+/*
+ * A guest's big anonymous reservation was refused. It is not an unreasonable
+ * request -- a phone caps the whole process at about four gigabytes of address
+ * space, and the JIT region (a gigabyte, mapped read-write and read-execute),
+ * the guest's APK mapping and the engine's own heap are all inside that cap --
+ * so when one is refused there are two things worth doing: say where the
+ * address space went, and try the request in the biggest hole the kernel left.
+ *
+ * The second is worth the effort because a hint-less anonymous mmap is placed in
+ * the kernel's own anonymous region, which a big guest arena can fail to fit even
+ * when the process as a whole has room; a hint out of a hole does not care which
+ * region it is in. A hole that a phantom range covers is passed over: the guest
+ * believes that range is its own, mapped or not.
+ *
+ * TL_MM_HOLE=0 turns the retry off (the report still comes out).
+ */
+static bool mm_hole_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *s = getenv("TL_MM_HOLE"); on = !(s && s[0] == '0'); }
+    return on != 0;
+}
+
+static bool va_gap_is_free(uint64_t at, uint64_t len)
+{
+    for (int i = 0; i < g_nphantom; i++) {
+        uint64_t b = g_phantom[i].base, e = b + g_phantom[i].len;
+        if (at < e && at + len > b) return false;
+    }
+    return true;
+}
+
+static void *va_retry_in_hole(size_t len)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static int reports;
+    pthread_mutex_lock(&lock);
+
+    /* The walk: every region of the task, the biggest few, and the biggest hole. */
+    uint64_t total = 0, hole = 0, hole_at = 0;
+    int regions = 0, top_n = 0;
+    struct { uint64_t addr, size; } top[6];
+    vm_address_t at = 0;
+    for (;;) {
+        vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        vm_address_t got = at;
+        if (vm_region_64(mach_task_self(), &got, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS) break;
+        if (got > at) {
+            uint64_t gap = (uint64_t)(got - at);
+            if (gap > hole && va_gap_is_free(at, gap)) { hole = gap; hole_at = at; }
+        }
+        if (size) {
+            total += size;
+            regions++;
+            if (top_n < 6) {                                /* keep the biggest few, largest first */
+                int i = top_n;
+                while (i > 0 && top[i - 1].size < size) { top[i] = top[i - 1]; i--; }
+                top[i].addr = got;
+                top[i].size = size;
+                top_n++;
+            } else if (size > top[5].size) {
+                int i = 5;
+                while (i > 0 && top[i - 1].size < size) { top[i] = top[i - 1]; i--; }
+                top[i].addr = got;
+                top[i].size = size;
+            }
+        }
+        uint64_t next = (uint64_t)got + size;
+        if (next <= at) break;                          /* no progress, or the space ran out */
+        at = (vm_address_t)next;
+    }
+    uint64_t tail_at = (uint64_t)at;                    /* past the last region the walk found */
+
+    if (reports < 8) {
+        reports++;
+        tl_log_line("mm: %#zx refused: the address space holds %llu MiB in %d regions, biggest hole %llu MiB at %p",
+                    len, (unsigned long long)(total >> 20), regions,
+                    (unsigned long long)(hole >> 20), (void *)(uintptr_t)hole_at);
+        for (int i = 0; i < top_n; i++)
+            tl_log_line("mm:   %p  %8llu MiB", (void *)(uintptr_t)top[i].addr,
+                        (unsigned long long)(top[i].size >> 20));
+    }
+
+    void *r = MAP_FAILED;
+    if (mm_hole_enabled()) {
+        uint64_t where = 0;
+        if (hole >= len && va_gap_is_free(hole_at, len)) {
+            where = hole_at;
+        } else if (va_gap_is_free(tail_at, len)) {
+            where = tail_at;                            /* above everything mapped: free by construction */
+        }
+        if (where) r = mmap((void *)(uintptr_t)where, len, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (r != MAP_FAILED)
+            tl_log_line("mm: %#zx came out of the address space at %p (the request was retried there)", len, r);
+        else if (where)
+            tl_log_line("mm: neither %p nor %p held %#zx (%s)", (void *)(uintptr_t)hole_at,
+                        (void *)(uintptr_t)tail_at, len, strerror(errno));
+    }
+    pthread_mutex_unlock(&lock);
+    return r;
+}
+
 /* Whether only the JIT region can execute here: the phone (iOS), or a Mac told to behave like one (TL_PHONE_JIT=1). */
 static bool phone_jit(void)
 {
@@ -1234,7 +1338,15 @@ static void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, long of
     void *r = refuse || (force_phantom && len == 2 * PHANTOM_HALF && prot == 0 && (flags & 0x20) && !(flags & 0x10)) ? MAP_FAILED
             : shifted ? shifted_file_map(addr, len, prot_filter(prot, "mmap"), df, fd, off)
             : mmap(addr, len, prot_filter(prot, "mmap"), df, (flags & 0x20) ? -1 : fd, off);
-    if (r == MAP_FAILED && (errno == ENOMEM || force_phantom) && prot == 0 && (flags & 0x20) && !(flags & 0x10)) { r = phantom_reserve(len); if (r != MAP_FAILED) errno = 0; }
+    if (r == MAP_FAILED && (errno == ENOMEM || force_phantom) && prot == 0 && (flags & 0x20) && !(flags & 0x10)) {
+        r = phantom_reserve(len);
+        if (r == MAP_FAILED && !refuse && len >= (8u << 20)) {
+            /* Not V8's cage, and big enough to matter: a guest arena the kernel's own
+             * placement could not fit. Report the address space and try a hole in it. */
+            r = va_retry_in_hole(len);
+        }
+        if (r != MAP_FAILED) errno = 0;
+    }
     TL_ERRNO_END();
     /* a file mapped executable (libffi's trampolines: its own library's code page, or a temporary file holding a copy): a phone
        can not make file pages executable, and a library's file offsets are not where the loader put its code, so the mapping

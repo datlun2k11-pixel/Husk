@@ -260,8 +260,8 @@ NAT(N_assetFd)
     const tl_zip *z = NULL;
     const tl_zip_entry *e = asset_find(tl_jni_string(a[0].l), &z);
     if (!e || e->method != 0) { *ret = J(-1); return true; }
-    const uint8_t *lh = z->map + e->local_offset;
-    uint64_t data = e->local_offset + 30 + (lh[26] | lh[27] << 8) + (lh[28] | lh[29] << 8);
+    uint64_t data = 0;
+    if (!tl_zip_data_offset(z, e, &data, NULL, 0)) { *ret = J(-1); return true; }
     int fd = z == tl_ld_apk_at(0) ? open(A.apk, O_RDONLY) : dup(z->fd);
     *ret = J(fd < 0 ? -1 : ((int64_t)fd << 40) | (int64_t)data);
     return true;
@@ -366,8 +366,8 @@ NAT(N_apkFileFd)
     const tl_zip *z = apk_n(a[0].i, &path);
     const tl_zip_entry *e = z && n ? tl_zip_find(z, n) : NULL;
     if (!e || e->method != 0) { *ret = J(-1); return true; }
-    const uint8_t *lh = z->map + e->local_offset;
-    uint64_t data = e->local_offset + 30 + (lh[26] | lh[27] << 8) + (lh[28] | lh[29] << 8);
+    uint64_t data = 0;
+    if (!tl_zip_data_offset(z, e, &data, NULL, 0)) { *ret = J(-1); return true; }
     int fd = path && path[0] ? open(path, O_RDONLY) : dup(z->fd);
     *ret = J(fd < 0 ? -1 : ((int64_t)fd << 40) | (int64_t)data);
     return true;

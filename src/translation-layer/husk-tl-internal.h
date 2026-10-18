@@ -82,22 +82,40 @@ typedef struct tl_zip_entry {
 
 typedef struct tl_zip {
     int            fd;
-    const uint8_t *map;
+    const uint8_t *map;       /* the file mapped whole; NULL: every read is a pread(2) */
     size_t         size;
     tl_zip_entry  *entries;
     size_t         count;
     uint64_t       touched;   /* bytes read since the mapping was last trimmed */
 } tl_zip;
 
-/* Reads the central directory. The file stays mapped until tl_zip_close(). */
+/*
+ * Reads the central directory. A file small enough to be worth the address
+ * space stays mapped until tl_zip_close(), and one that is not -- a game's
+ * gigabyte APK, on a phone whose whole address space is about four -- is read
+ * with pread(2) instead, or mapped only where it is asked for. Nothing above
+ * this cares which happened, but see tl_zip_mapped().
+ */
 bool tl_zip_open(tl_zip *z, const char *path, char *err, size_t errlen);
 void tl_zip_close(tl_zip *z);
 const tl_zip_entry *tl_zip_find(const tl_zip *z, const char *name);
+/* Whether the file is mapped whole (affects nothing but the cost of a read). */
+bool tl_zip_mapped(const tl_zip *z);
 
 /*
- * An entry's bytes. A stored entry points straight into the mapping and
- * `*owned` is false; a deflated one is inflated into a buffer the caller must
- * free(), and `*owned` is true. Entries larger than `limit` are refused.
+ * Where an entry's bytes begin: past its local header, whose own name and extra
+ * field need not be the central directory's. For callers that hand an asset's
+ * place in the file to someone else (a descriptor, a range) rather than reading
+ * it here.
+ */
+bool tl_zip_data_offset(const tl_zip *z, const tl_zip_entry *e, uint64_t *off,
+                        char *err, size_t errlen);
+
+/*
+ * An entry's bytes. A stored entry points straight into the mapping (of the
+ * file, or of just that entry) and `*owned` is false; a deflated one, or a
+ * stored one in a file that is not mapped, is read into a buffer the caller
+ * must free(), and `*owned` is true. Entries larger than `limit` are refused.
  */
 bool tl_zip_data(const tl_zip *z, const tl_zip_entry *e, size_t limit,
                  const uint8_t **out, size_t *out_len, bool *owned,
@@ -116,7 +134,8 @@ void tl_zip_trim(tl_zip *z);
 /*
  * An entry as a stream: it is read one small window at a time, so a deflated
  * asset is never held whole -- a 1 GiB one opens in a quarter of a megabyte.
- * A stored entry reads straight out of the mapping. `pos` runs over the
+ * A stored entry reads straight out of the mapping (of the file, or of just
+ * that entry, when the file is not mapped whole). `pos` runs over the
  * uncompressed bytes; seeks backwards re-inflate what they skip (raw deflate
  * has no memory). Failing paths return `(size_t)-1` for sizes and positions.
  */
@@ -135,7 +154,8 @@ uint64_t tl_zip_stream_len(const tl_zip_stream *s);
  * re-inflating from the top). `(uint64_t)-1` is failure. */
 uint64_t tl_zip_stream_seek(tl_zip_stream *s, uint64_t at, char *err, size_t errlen);
 /* The whole entry, from its first byte, held by the stream. The reads so far
- * do not constrain it. A stored entry's answer points into the mapping. */
+ * do not constrain it. A stored entry's answer points into a mapping of the
+ * file (or of its own bytes), and stays valid until the stream is closed. */
 const uint8_t *tl_zip_stream_whole(tl_zip_stream *s, char *err, size_t errlen);
 void tl_zip_stream_close(tl_zip_stream *s);
 

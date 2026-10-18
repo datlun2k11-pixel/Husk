@@ -99,10 +99,9 @@ static bool stored_range(const char *apk, const char *entry, unsigned long long 
     if (!tl_zip_open(&z, apk, err, sizeof(err))) return false;
     const tl_zip_entry *e = tl_zip_find(&z, entry);
     bool ok = false;
-    if (e && e->method == 0 && e->local_offset + 30 < z.size) {
-        const uint8_t *h = z.map + e->local_offset;
-        uint16_t nlen, elen; memcpy(&nlen, h + 26, 2); memcpy(&elen, h + 28, 2);
-        *off = e->local_offset + 30 + nlen + elen; *size = e->usize; ok = true;
+    uint64_t data = 0;
+    if (e && e->method == 0 && tl_zip_data_offset(&z, e, &data, NULL, 0)) {
+        *off = data; *size = e->usize; ok = true;
     }
     tl_zip_close(&z);
     return ok;

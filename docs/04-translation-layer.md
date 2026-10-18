@@ -185,9 +185,35 @@ startup. Three things answer it:
   milliseconds. The loader trims too, after each library it has carved into JIT
   memory.
 
+Footprint is not the only thing an APK costs: mapping it whole also *takes its
+size in address space*, for as long as the game runs, and a phone without the
+extended-address-space entitlement has about four gigabytes of that in total —
+the JIT region is a gigabyte of it (512 MiB mapped read-write and read-execute)
+and a 2 GB game APK is another half. Once the sum ran out, the engine's own
+reservation of a few hundred megabytes came back `ENOMEM`, and a null
+dereference inside it was the crash: Don't Starve's Unity player, at
+`nativeResume`, asking for 512 MiB. So:
+
+- an archive under 64 MiB (`TL_ZIP_MAP_MAX_MB`) is mapped whole as before, and a
+  bigger one is not mapped at all: every read is a `pread(2)` of the file, which
+  costs a system call and no address space. A file that *cannot* be mapped —
+  a big one on a phone that is already full — opens this way too, so the size
+  limit is a preference, not a requirement;
+- a stored entry of an unmapped archive still answers with a pointer, as
+  Android's does, over a mapping of *that entry* taken when something asks for
+  one and given back when the stream closes. The address space a game holds for
+  assets is then the assets it actually opened, rather than its whole APK;
+- if a big anonymous reservation is refused anyway, the layer walks the task's
+  VM regions, logs where the address space went, and retries the reservation in
+  the biggest hole the kernel left (a hint-less mapping lands in the kernel's
+  own anonymous area, which a guest arena can fail to fit even when the process
+  as a whole has room). `TL_MM_HOLE=0` turns the retry off; the log stays.
+
 `tools/zipstream-test.c` streams a 256 MiB deflated entry and checks its bytes
 byte for byte at random offsets; the run's peak memory stays under 32 MiB,
-where the old whole-inflating read needed 257 MiB.
+where the old whole-inflating read needed 257 MiB. It is run twice, once with
+the archive mapped and once with `TL_ZIP_MAP_MAX_MB=0`, so both read paths
+answer with the same bytes.
 
 ### The thread register: measured on the phone
 

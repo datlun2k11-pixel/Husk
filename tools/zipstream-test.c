@@ -3,7 +3,12 @@
  * opens an asset is the same bytes tl_zip_data always did, but a deflated
  * entry of any size reads in a few hundred kilobytes of its own.
  *
+ * It is worth running twice: once with the archive mapped whole, and once with
+ * TL_ZIP_MAP_MAX_MB=0, where every read is a pread(2) and a stored entry gets a
+ * mapping of its own.
+ *
  *   bash tools/regress/build.sh tools/zipstream-test.c /tmp/zipstream-test && /tmp/zipstream-test
+ *   TL_ZIP_MAP_MAX_MB=0 /tmp/zipstream-test
  */
 #include "husk-tl-internal.h"
 
@@ -13,6 +18,8 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+void tl_log_line(const char *fmt, ...) { (void)fmt; }   /* husk-tl-load.c, not linked here */
 
 static int fails;
 
@@ -65,6 +72,7 @@ int main(void)
 
     tl_zip z; char err[256];
     if (!tl_zip_open(&z, apkp, err, sizeof(err))) { printf("FAIL: open: %s\n", err); return 2; }
+    printf("# the archive is %s\n", tl_zip_mapped(&z) ? "mapped whole" : "unmapped, read with pread");
 
     /* ---- the point of all this: a huge deflated entry streams in a little memory ----
      * It runs before the test's own truth buffers are allocated, so the peak below
@@ -256,8 +264,8 @@ int main(void)
             if (tl_zip_open(&cz, copyp, err, sizeof(err))) {
                 const tl_zip_entry *e = tl_zip_find(&cz, "big.bin");
                 if (e) {
-                    const uint8_t *l = cz.map + e->local_offset;
-                    off = (long)(e->local_offset + 30 + (l[26] | l[27] << 8) + (l[28] | l[29] << 8));
+                    uint64_t data = 0;
+                    if (tl_zip_data_offset(&cz, e, &data, err, sizeof(err))) off = (long)data;
                 }
                 tl_zip_close(&cz);
             }

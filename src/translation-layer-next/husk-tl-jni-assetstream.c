@@ -84,10 +84,10 @@ bool tl_assetstream_stored(const char *name, int *fd, int64_t *off, int64_t *len
         if (!z) return false;
         const tl_zip_entry *e = tl_zip_find(z, path);
         if (!e) continue;
-        if (e->method != 0 || e->local_offset + 30 >= z->size) return false;
-        const uint8_t *h = z->map + e->local_offset;
-        uint16_t nlen, elen; memcpy(&nlen, h + 26, 2); memcpy(&elen, h + 28, 2);
-        *off = (int64_t)(e->local_offset + 30 + nlen + elen); *len = (int64_t)e->usize;
+        if (e->method != 0) return false;
+        uint64_t data = 0;
+        if (!tl_zip_data_offset(z, e, &data, NULL, 0)) return false;
+        *off = (int64_t)data; *len = (int64_t)e->usize;
         *fd = dup(z->fd);
         return *fd >= 0;
     }

@@ -8,7 +8,9 @@ on:
 jobs:
   # The zip layer is plain C over zlib, and its streaming test runs anywhere:
   # it builds an archive, streams a 256 MiB deflated entry out of it byte by
-  # byte, and checks that the run never holds the entry in memory.
+  # byte, and checks that the run never holds the entry in memory. It runs both
+  # ways round: with the archive mapped whole, and (TL_ZIP_MAP_MAX_MB=0) with
+  # every read a pread and a stored entry mapped on its own.
   zip-layer:
     name: asset streaming (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -28,7 +30,9 @@ jobs:
             tools/zipstream-test.c src/translation-layer/husk-tl-zip.c \
             -lz -o zipstream-test
       - name: run
-        run: ./zipstream-test
+        run: |
+          ./zipstream-test                     # the archive mapped whole
+          TL_ZIP_MAP_MAX_MB=0 ./zipstream-test # every read a pread
 
   # macos-14 runs on arm64, which is what the layer's inline assembly, its JIT
   # calls and Darwin's thread-state structs need: an Intel machine cannot even
