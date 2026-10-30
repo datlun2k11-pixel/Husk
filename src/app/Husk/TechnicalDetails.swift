@@ -52,7 +52,7 @@ struct TLTechnicalView: View {
     private var arm64: [TLLibrary] { (report?.libraries ?? []).filter { $0.abi == "arm64-v8a" } }
 
     var body: some View {
-        List {
+        HuskPageList {
             Section("Runtime") {
                 row("Runs With", report?.runnerName ?? "Not scanned")
                 row("Package", app.packageName ?? "—", mono: true)

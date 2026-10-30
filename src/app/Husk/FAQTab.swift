@@ -16,7 +16,7 @@ struct FAQTab: View {
     }
 
     var body: some View {
-            List {
+            HuskPageList {
                 ForEach(sections) { s in
                     Section {
                         ForEach(s.items) { item in FAQRow(item: item, expanded: !query.isEmpty) }

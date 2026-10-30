@@ -168,11 +168,23 @@ const char *tl_path_resolve(const char *path, char *buf, size_t n)
 {
     if (!path) return path;
     if (g_sysfonts[0]) {
-        if (!strncmp(path, "/system/fonts", 13) && (path[13] == 0 || path[13] == '/')) {
-            snprintf(buf, n, "%s/fonts%s", g_sysfonts, path + 13);
-            if (g_extrafonts[0] && path[13] == '/' && access(buf, F_OK) != 0) {
+        const char *font_suffix = NULL;
+        if (!strncmp(path, "/system/fonts", 13) && (path[13] == 0 || path[13] == '/'))
+            font_suffix = path + 13;
+        /* Java uses its writable data directory as ANDROID_ROOT. Skia joins that
+         * root with /fonts; route just that subtree through the same system and
+         * downloaded-font lookup, without changing Java's environment or data paths. */
+        const char *root = getenv("ANDROID_ROOT");
+        size_t root_len = root ? strlen(root) : 0;
+        if (!font_suffix && root_len && !strncmp(path, root, root_len) &&
+            !strncmp(path + root_len, "/fonts", 6) &&
+            (path[root_len + 6] == 0 || path[root_len + 6] == '/'))
+            font_suffix = path + root_len + 6;
+        if (font_suffix) {
+            snprintf(buf, n, "%s/fonts%s", g_sysfonts, font_suffix);
+            if (g_extrafonts[0] && font_suffix[0] == '/' && access(buf, F_OK) != 0) {
                 char extra[1100];
-                snprintf(extra, sizeof(extra), "%s%s", g_extrafonts, path + 13);
+                snprintf(extra, sizeof(extra), "%s%s", g_extrafonts, font_suffix);
                 if (access(extra, F_OK) == 0) snprintf(buf, n, "%s", extra);
             }
             return buf;
@@ -1096,10 +1108,49 @@ static void mm_trace(const char *what, void *a, size_t l, long x, long y)
 static struct { uintptr_t base; size_t len, real; } g_phantom[4];
 static int g_nphantom;
 
+/* Reserve before JIT aliases fragment the available aligned address range.
+ * This owns address space only; guest commits still happen on demand. */
+static vm_address_t g_compressed_heap;
+static pthread_mutex_t g_compressed_heap_lock = PTHREAD_MUTEX_INITIALIZER;
+void husk_prepare_compressed_heap(void)
+{
+    pthread_mutex_lock(&g_compressed_heap_lock);
+    if (!g_compressed_heap) {
+        vm_address_t address = 0;
+        kern_return_t kr = vm_map(mach_task_self(), &address, PHANTOM_HALF,
+            PHANTOM_HALF - 1, VM_FLAGS_ANYWHERE, MACH_PORT_NULL, 0, FALSE,
+            VM_PROT_NONE, VM_PROT_ALL, VM_INHERIT_COPY);
+        if (kr == KERN_SUCCESS) g_compressed_heap = address;
+    }
+    pthread_mutex_unlock(&g_compressed_heap_lock);
+}
+void husk_release_unused_compressed_heap(void)
+{
+    pthread_mutex_lock(&g_compressed_heap_lock);
+    if (g_compressed_heap && vm_deallocate(mach_task_self(), g_compressed_heap, PHANTOM_HALF) == KERN_SUCCESS)
+        g_compressed_heap = 0;
+    pthread_mutex_unlock(&g_compressed_heap_lock);
+}
+static bool compressed_heap_request(size_t len)
+{
+    /* V8 asks for 8 GiB; Dart omits the final host page from that request. */
+    return len == 2 * PHANTOM_HALF || len == 2 * PHANTOM_HALF - (size_t)getpagesize();
+}
+
 static void *phantom_reserve(size_t len)
 {
-    if (len != 2 * PHANTOM_HALF || g_nphantom >= 4) return MAP_FAILED;
-    void *res = MAP_FAILED;
+    if (!compressed_heap_request(len) || g_nphantom >= 4) return MAP_FAILED;
+    pthread_mutex_lock(&g_compressed_heap_lock);
+    vm_address_t address = g_compressed_heap;
+    g_compressed_heap = 0; /* ownership transfers to g_phantom below */
+    pthread_mutex_unlock(&g_compressed_heap_lock);
+    if (!address) {
+        if (vm_map(mach_task_self(), &address, PHANTOM_HALF, PHANTOM_HALF - 1,
+                   VM_FLAGS_ANYWHERE, MACH_PORT_NULL, 0, FALSE,
+                   VM_PROT_NONE, VM_PROT_ALL, VM_INHERIT_COPY) != KERN_SUCCESS)
+            address = 0;
+    }
+    void *res = address ? (void *)address : MAP_FAILED;
     /* Reserve 5 GiB, which holds an aligned 4 GiB only when it starts in the first GiB of an alignment period. Mappings come one after
      * another, so a miss is kept (it moves the next one on by a GiB) and given back once there is a hit. */
     void *held[8]; int nheld = 0;
@@ -1297,8 +1348,25 @@ static bool shifted_unmap(void *a, int *ret)
     pthread_mutex_unlock(&g_shifted_lock);
     return false;
 }
+void *tl_ld_map_code(const char *path, uint64_t off, size_t len, void *at);
 static void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, long off)
 {
+    /* A library file mapped executable (libffi's static trampolines): for a library imported from a dylib, its own signed code */
+    if ((prot & PROT_EXEC) && !(flags & 0x20) && fd >= 0 && off >= 0) {
+        char path[PATH_MAX];
+        if (fcntl(fd, F_GETPATH, path) != -1) {
+            void *r = tl_ld_map_code(path, (uint64_t)off, len, (flags & 0x10) ? addr : NULL);
+            if (r) { tl_note_once("a library's file mapped executable (libffi trampolines): its signed code is mapped again"); mm_trace("mmap-code", r, len, prot, flags); return r; }
+        }
+    }
+    /* JIT-less mode (TL_NO_XMEM): no executable memory exists, so a guest's own executable mapping (a regex or script JIT:
+     * PCRE2 under Qt) fails outright and the guest falls back to its interpreter; handing it plain memory would have it jump
+     * into data */
+    if ((prot & PROT_EXEC) && (flags & 0x20) && getenv("TL_NO_XMEM")) {
+        tl_note_once("JIT-less: the guest asked for executable memory of its own: refused (EACCES)");
+        tl_set_guest_errno(13);
+        return MAP_FAILED;
+    }
     /* A hooking library's trampolines (Geode): executable memory is a piece of the JIT region, written through the other view. */
     if ((prot & PROT_EXEC) && (flags & 0x20) && !(flags & 0x10) && tl_codewrite_enabled()) {
         uint8_t *rx, *rw;
@@ -1335,7 +1403,7 @@ static void *b_mmap(void *addr, size_t len, int prot, int flags, int fd, long of
     bool refuse = len > max_map && (flags & 0x20) && !(flags & 0x10);
     if (refuse) { tl_log_line("mm: refusing %#zx bytes (TL_MM_MAX_GIB)", len); errno = ENOMEM; }
     bool shifted = !(flags & 0x20) && fd >= 0 && (off & (getpagesize() - 1)) != 0 && (off & 4095) == 0;
-    void *r = refuse || (force_phantom && len == 2 * PHANTOM_HALF && prot == 0 && (flags & 0x20) && !(flags & 0x10)) ? MAP_FAILED
+    void *r = refuse || (force_phantom && compressed_heap_request(len) && prot == 0 && (flags & 0x20) && !(flags & 0x10)) ? MAP_FAILED
             : shifted ? shifted_file_map(addr, len, prot_filter(prot, "mmap"), df, fd, off)
             : mmap(addr, len, prot_filter(prot, "mmap"), df, (flags & 0x20) ? -1 : fd, off);
     if (r == MAP_FAILED && (errno == ENOMEM || force_phantom) && prot == 0 && (flags & 0x20) && !(flags & 0x10)) {
@@ -1413,7 +1481,7 @@ static int b_mprotect(void *a, size_t l, int prot)
             }
         }
         static int allow = -1;
-        if (allow < 0) allow = getenv("TL_NO_GUEST_JIT") ? 0 : 1;
+        if (allow < 0) allow = getenv("TL_NO_GUEST_JIT") || getenv("TL_NO_XMEM") ? 0 : 1;   /* JIT-less: as a phone with no debugger */
         int r = -1;
         if (allow) {
             TL_ERRNO_BEGIN();

@@ -64,6 +64,11 @@ bool tl_unity_start(const tl_unity_config *cfg)
     int n = tl_dexidx_open(cfg->apk_path);
     tl_log_line("unity: %d classes in the APK's DEX", n);
     if (!tl_ld_add_apk(cfg->apk_path)) return false;
+    /* A player built to require ES 3.1 or 3.2 (its manifest's glEsVersion) asks only for those contexts and gives up on "your
+     * device does not match the hardware requirements" when ANGLE refuses: it gets the 3.0 context described as 3.1/3.2 */
+    { int tl_manifest_gles(const char *); void tl_egl_es3_claim(int); int gv = tl_manifest_gles(cfg->apk_path);
+      if (getenv("TL_GLES_CLAIM")) gv = 0x30000 | atoi(getenv("TL_GLES_CLAIM"));   /* TL_GLES_CLAIM=<minor>: as if the manifest said 3.<minor> */
+      if (gv >= 0x30001) { tl_egl_es3_claim(gv & 0xffff); tl_log_line("egl: the manifest asks for OpenGL ES 3.%d: the driver is described so", gv & 0xffff); } }
     if (cfg->angle_egl && !tl_egl_init(cfg->angle_egl, cfg->angle_gles, cfg->frame_dir, cfg->frame_every)) return false;
     tl_jni_init();
     tl_hle_configure(cfg->package_name, cfg->apk_path, cfg->data_dir, cfg->width, cfg->height);
@@ -74,6 +79,10 @@ bool tl_unity_start(const tl_unity_config *cfg)
      * which is System.load(dir + "/libmain.so") followed by NativeLoader.load(dir). */
     U.activity = tl_hle_activity();
     U.player = tl_jni_new_object(tl_jni_class("com/unity3d/player/UnityPlayer"));
+
+    /* Android's main thread has its Looper before any app code runs: Unity's libmain asks for it while loading (JNI_OnLoad
+     * -> ALooper_forThread), and the NULL it gets here is kept as the engine's main-thread queue and dereferenced later. */
+    { void *(*looper_prepare)(int) = tl_bionic_find("ALooper_prepare"); if (looper_prepare) looper_prepare(0); }
 
     tl_lib *main_lib = tl_ld_load("libmain.so");
     if (!main_lib) return false;
@@ -164,9 +173,19 @@ static void *unity_main(void *arg)
 bool tl_unity_run(void)
 {
     /* The UnityPlayer constructor's last native step before it starts the thread. */
-    /* Unity 6 adds the kind of host it runs in (0: an activity or service, 1: a GameActivity) */
-    if (tl_jni_native("com/unity3d/player/UnityPlayer", "initJni", "(Landroid/content/Context;)V")) NATIVE_VOID("initJni", "(Landroid/content/Context;)V", U.activity, 0);
-    else NATIVE_VOID("initJni", "(Landroid/content/Context;I)V", U.activity, 0);
+    /* Unity 6 adds the kind of host it runs in (0: an activity or service, 1: a GameActivity) and, in some players, a
+     * string beside it; which one a player has is its RegisterNatives' to say. Asking for the wrong one means initJni
+     * never runs, and the engine then holds NULL for the Java side's classes (GetMethodID(NULL class, ...) later). */
+    void *init3 = tl_jni_native("com/unity3d/player/UnityPlayer", "initJni", "(Landroid/content/Context;ILjava/lang/String;)V");
+    void *init2 = init3 ? NULL : tl_jni_native("com/unity3d/player/UnityPlayer", "initJni", "(Landroid/content/Context;I)V");
+    if (init3) {
+        jobj *kind = tl_jni_new_string("");
+        ((void (*)(void *, jobj *, jobj *, int, jobj *))init3)(tl_jni_env(), U.player, U.activity, 0, kind);
+    } else if (init2) {
+        ((void (*)(void *, jobj *, jobj *, int))init2)(tl_jni_env(), U.player, U.activity, 0);
+    } else {
+        NATIVE_VOID("initJni", "(Landroid/content/Context;)V", U.activity, 0);
+    }
     tl_log_line("unity: initJni done");
     /* The rest of the UnityPlayer constructor: the helpers it builds, whose constructors each call a
      * native that gives the engine its reference to the helper's Java class. Without these the engine

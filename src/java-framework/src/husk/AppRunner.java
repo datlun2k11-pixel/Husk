@@ -251,7 +251,10 @@ public final class AppRunner {
            result, the caller hears the user backed out, as it would on a phone; otherwise nothing opens */
         String pkg = i.getComponent() != null ? i.getComponent().getPackageName() : i.getPackage();
         boolean system = "android".equals(pkg) || "com.android.settings".equals(pkg) || "com.android.permissioncontroller".equals(pkg)
-            || (action != null && (action.startsWith("android.settings.") || action.startsWith("android.provider.Settings")));
+            || (action != null && (action.startsWith("android.settings.") || action.startsWith("android.provider.Settings")))
+            // the platform's own dialogs (turn on Bluetooth, NFC, device admin, the camera, request a role...): a phone always has
+            // a screen for these; Husk has none, so the caller hears the user said no (#170: SwagCycle asked for Bluetooth)
+            || (action != null && action.startsWith("android.") && pkg == null && i.getComponent() == null);
         if (system) {
             final Activity caller = from instanceof Activity ? (Activity) from : top();
             if (request >= 0 && caller != null) sHandler.post(() -> caller.huskActivityResult(request, Activity.RESULT_CANCELED, null));
@@ -382,5 +385,5 @@ public final class AppRunner {
             if (phase == 3) down = 0;
         }
     }
-    static final class ViewRootDispatch { static void key(KeyEvent e) { if (!ViewRoot.dispatchKey(e)) { Activity a = top(); if (a != null) a.dispatchKeyEvent(e); } } }
+    static final class ViewRootDispatch { static void key(KeyEvent e) { if (ViewRoot.keyTarget() != null) ViewRoot.dispatchKey(e); else { Activity a = top(); if (a != null) a.dispatchKeyEvent(e); } } }
 }

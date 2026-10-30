@@ -19,6 +19,8 @@ public final class Manifest {
         public final ArrayList<String> actions = new ArrayList<>(), categories = new ArrayList<>(), schemes = new ArrayList<>(), mimeTypes = new ArrayList<>(), hosts = new ArrayList<>();
     }
     public static String packageName, applicationClass, versionName, appComponentFactory;
+    /** android:installLocation (-1 when the manifest does not say; some apps check theirs, #167). */
+    public static int installLocation = -1;
     public static int versionCode, minSdk = 21, targetSdk = 34, appTheme, appLabel, appIcon, appFlags;
     public static boolean debuggable, largeHeap, hardwareAccelerated = true, extractNativeLibs = true;
     public static Bundle appMetaData = new Bundle();
@@ -59,6 +61,7 @@ public final class Manifest {
                     packageName = p.getAttributeValue(null, "package");
                     versionCode = p.getAttributeIntValue(NS, "versionCode", 1);
                     versionName = p.getAttributeValue(NS, "versionName");
+                    installLocation = p.getAttributeIntValue(NS, "installLocation", -1);
                     break;
                 case "uses-sdk":
                     minSdk = p.getAttributeIntValue(NS, "minSdkVersion", 21);

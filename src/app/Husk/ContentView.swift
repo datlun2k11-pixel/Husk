@@ -166,6 +166,9 @@ struct ContentView: View {
         .task { await CompatibilityStore.shared.refresh() }
         .sheet(isPresented: $router.showFiles) { FilesTab() }
         .sheet(isPresented: $router.showDownloads) { DownloadsTab() }
+        .sheet(isPresented: $router.showProfile) { ProfileView() }
+        .sheet(isPresented: $router.showImport) { ImportView() }
+        .task { await Account.shared.refresh() }
         // Pictures for the apps here: read the index on launch and whenever the set of apps changes.
         .task(id: showcasePackages) { showcase.refresh(for: showcasePackages) }
         .alert("Metadata Updated", isPresented: Binding(get: { showcase.shouldAsk && !showOnboarding },

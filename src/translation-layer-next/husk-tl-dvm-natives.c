@@ -1968,6 +1968,8 @@ static const entry k_natives[] = {
 
     { "java/lang/Class", "getNameNative", "()Ljava/lang/String;", Class_getNameNative },
     { "java/lang/Class", "classForName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", Class_classForName },
+    /* Unity (newer players) asks for a class by its three-argument forName; ART hands that to the same native lookup */
+    { "java/lang/Class", "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", Class_classForName },
     { "java/lang/Class", "getPrimitiveClass", "(Ljava/lang/String;)Ljava/lang/Class;", Class_getPrimitiveClass },
     { "java/lang/Class", "getInterfacesInternal", "()[Ljava/lang/Class;", Class_getInterfacesInternal },
     { "java/lang/Class", "newInstance", "()Ljava/lang/Object;", Class_newInstance },

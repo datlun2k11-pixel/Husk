@@ -894,5 +894,7 @@ const tl_bionic_entry tl_tab_str2[] = {
     TL_WRAP("feholdexcept", b_fe_env), TL_WRAP("fegetenv", b_fe_env), TL_WRAP("fesetenv", b_fe_env), TL_WRAP("feupdateenv", b_fe_env), TL_WRAP("fegetround", b_fe_ok), TL_WRAP("fesetround", b_fe_ok), TL_WRAP("feclearexcept", b_fe_ok), TL_WRAP("feraiseexcept", b_fe_ok), TL_WRAP("fetestexcept", b_fe_ok),
     TL_DIRECT(regcomp), TL_DIRECT(regexec), TL_DIRECT(regfree), TL_DIRECT(regerror), TL_DIRECT(sinh), TL_DIRECT(sinhf), TL_DIRECT(scalbnf), TL_DIRECT(mbstowcs), TL_DIRECT(wcstombs), TL_DIRECT(exp2), TL_DIRECT(expm1), TL_DIRECT(log1p), TL_DIRECT(hypotf), TL_DIRECT(ilogbf), TL_DIRECT(nextafter),
     TL_DIRECT(nextafterf), TL_DIRECT(frexpf), TL_DIRECT(if_indextoname),
+    /* C99: the neighbour of a value, and of a value in the direction of another (Unity's il2cpp calls these) */
+    TL_DIRECT(nexttoward), TL_DIRECT(nexttowardf),
     TL_END
 };

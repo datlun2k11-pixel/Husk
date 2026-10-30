@@ -10,6 +10,7 @@
 #include "husk-tl-dvm-javaapp.h"
 #include "husk-tl-dvm-gl.h"
 
+#include <CoreFoundation/CoreFoundation.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -465,6 +466,18 @@ NAT(N_pickDocuments)
 }
 NAT(N_setOrientation) { (void)self; (void)ret; if (A.cfg.set_orientation) A.cfg.set_orientation(a[0].i); return true; }
 NAT(N_nightMode) { (void)self; (void)a; jvalue v; v.j = A.cfg.night_mode ? 1 : 0; *ret = v; return true; }
+/* 24-hour time as the phone's region and Settings > General > Date & Time choose it: the locale's hour pattern ("j") has no am/pm */
+NAT(N_is24Hour)
+{
+    (void)self; (void)a;
+    bool h24 = true;
+    CFLocaleRef loc = CFLocaleCopyCurrent();
+    CFStringRef f = loc ? CFDateFormatterCreateDateFormatFromTemplate(NULL, CFSTR("j"), 0, loc) : NULL;
+    if (f) { h24 = CFStringFind(f, CFSTR("a"), 0).location == kCFNotFound; CFRelease(f); }
+    if (loc) CFRelease(loc);
+    jvalue v; v.j = h24; *ret = v;
+    return true;
+}
 NAT(N_insets)
 {
     (void)self; (void)a;
@@ -526,6 +539,7 @@ static const struct { const char *name, *sig; dvm_native_fn fn; } k_native[] = {
     { "setOrientation", "(I)V", N_setOrientation },
     { "insets", "()[I", N_insets },
     { "nightMode", "()Z", N_nightMode },
+    { "is24Hour", "()Z", N_is24Hour },
     { NULL, NULL, NULL },
 };
 
@@ -995,6 +1009,16 @@ static void *gl_main(void *arg)
             makeCurrent(dpy, surf, surf, app);
             jvalue draw = tl_jni_call(A.gl_view, "huskBeginFrame", "()Z", NULL);
             if (tl_jni_pending()) log_pending("a queued GL event");
+            /* the view's surface changed size (laid out again: the app hid the bars, or turned): onSurfaceChanged again, as GLThread does */
+            jvalue rs = tl_jni_call(A.gl_view, "huskTakeResize", "()J", NULL);
+            if (tl_jni_pending()) log_pending("huskTakeResize");
+            if (rs.j) {
+                jvalue p3[3] = { L(gl10), I((int)(rs.j >> 32)), I((int)(rs.j & 0xffffffff)) };
+                tl_log_line("javaapp: the GL view is now %dx%d", (int)(rs.j >> 32), (int)(rs.j & 0xffffffff));
+                tl_jni_call(A.gl_renderer, "onSurfaceChanged", "(Ljavax/microedition/khronos/opengles/GL10;II)V", p3);
+                if (tl_jni_pending()) log_pending("onSurfaceChanged");
+                draw.z = true;
+            }
             /* a new frame of views needs the scene under it again: what was swapped is gone */
             if (draw.z || fresh || atomic_exchange(&A.render_requested, false)) {
                 tl_jni_call(A.gl_renderer, "onDrawFrame", "(Ljavax/microedition/khronos/opengles/GL10;)V", p1);
@@ -1155,6 +1179,8 @@ bool tl_javaapp_start(const tl_javaapp_config *cfg)
     { void tl_codewrite_enable(void); tl_codewrite_enable(); }
     A.cfg = *cfg;
     snprintf(A.apk, sizeof(A.apk), "%s", cfg->apk_path);
+    /* JIT-less mode: LuaJIT (LÖVE games) runs its interpreter, as the SDL driver already has it do */
+    if (getenv("TL_NO_XMEM")) { void tl_luajit_interpreter_only(void); tl_luajit_interpreter_only(); }
     /* an app whose manifest needs OpenGL ES 3.1 or 3.2 is told the driver has it (ANGLE over Metal stops at 3.0; the shim writes
        its 310/320 es shaders down), as it would otherwise refuse to start */
     { int tl_manifest_gles(const char *); void tl_egl_es3_claim(int); int gv = tl_manifest_gles(cfg->apk_path);

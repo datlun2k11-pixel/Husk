@@ -149,6 +149,10 @@ struct OnboardingView: View {
         d.set(sound, forKey: "husk.sound")
         d.set(autoSave, forKey: "husk.autoSave")
         d.set(language, forKey: Onboarding.languageKey)
+        // Husk's own screens and the apps in it use this language from the next launch (#156): iOS's per-app language, which the
+        // runtime also reads for the apps' locale. Only when it differs from the phone's, so the phone's choice keeps applying otherwise.
+        if !(Locale.preferredLanguages.first ?? "en").hasPrefix(language) { d.set([language], forKey: "AppleLanguages") }
+        else { d.removeObject(forKey: "AppleLanguages") }
         d.set(region, forKey: Onboarding.regionKey)
         d.set(timeZone, forKey: Onboarding.timeZoneKey)
         Onboarding.complete()
@@ -166,7 +170,7 @@ struct OnboardingView: View {
         case .welcome: welcome
         case .language:
             picker(symbol: "globe", title: "Language",
-                   subtitle: "The language apps and games inside Husk see. Husk itself follows your iPhone.",
+                   subtitle: "The language Husk and the apps and games in it use, from the next time Husk opens.",
                    rows: Self.languages, selection: $language)
         case .region:
             picker(symbol: "map.fill", title: "Region",

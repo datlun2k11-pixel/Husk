@@ -1096,9 +1096,14 @@ static void mangle(const char *s, char *out, size_t n, bool sig)
     out[k] = 0;
 }
 
+unsigned tl_jni_natives_generation(void);
 static void *find_jni(dvm_method *m)
 {
-    if (m->jni_looked) return m->jni;
+    /* cached until the next RegisterNatives: Dex2C-protected apps register a class's natives from its <clinit>, which can come after
+       a first lookup (#152, #174); and a miss is never final */
+    unsigned gen = tl_jni_natives_generation();
+    if (m->jni_looked && m->jni && m->jni_gen == gen) return m->jni;
+    m->jni_gen = gen;
     void *fn = tl_jni_native(m->cls->name, m->name, m->sig);
     if (!fn) {
         char cls[400], nm[200], sg[400], sym[1100];

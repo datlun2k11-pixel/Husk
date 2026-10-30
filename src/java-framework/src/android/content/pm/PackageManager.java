@@ -68,6 +68,7 @@ public class PackageManager {
         PackageInfo p = new PackageInfo();
         p.packageName = pkg; p.versionCode = husk.Manifest.versionCode; p.versionName = husk.Manifest.versionName != null ? husk.Manifest.versionName : "1.0";
         p.firstInstallTime = p.lastUpdateTime = new java.io.File(husk.Native.apkPath()).lastModified();
+        p.installLocation = husk.Manifest.installLocation;
         p.requestedPermissions = husk.Manifest.permissions.toArray(new String[0]);
         p.requestedPermissionsFlags = new int[p.requestedPermissions.length];
         java.util.Arrays.fill(p.requestedPermissionsFlags, PackageInfo.REQUESTED_PERMISSION_GRANTED);
@@ -110,7 +111,18 @@ public class PackageManager {
         if (name.equals(FEATURE_INPUT_METHODS) || name.equals(FEATURE_GAMEPAD)) return true;
         return false;
     }
-    public FeatureInfo[] getSystemAvailableFeatures() { return new FeatureInfo[0]; }
+    /* As a phone lists them: the features hasSystemFeature says yes to, and one unnamed entry carrying the device's OpenGL ES version
+     * (engines such as KorGE pick their GL context version from it, and take ES 1 when it is missing). */
+    public FeatureInfo[] getSystemAvailableFeatures() {
+        String[] names = { "android.hardware.touchscreen", "android.hardware.touchscreen.multitouch", "android.hardware.touchscreen.multitouch.distinct",
+                           FEATURE_FAKETOUCH, FEATURE_SCREEN_PORTRAIT, FEATURE_SCREEN_LANDSCAPE, FEATURE_WIFI, FEATURE_AUDIO_OUTPUT,
+                           FEATURE_OPENGLES_EXTENSION_PACK, FEATURE_SENSOR_ACCELEROMETER, FEATURE_INPUT_METHODS, FEATURE_GAMEPAD };
+        FeatureInfo[] f = new FeatureInfo[names.length + 1];
+        for (int i = 0; i < names.length; i++) { f[i] = new FeatureInfo(); f[i].name = names[i]; }
+        f[names.length] = new FeatureInfo();
+        f[names.length].reqGlEsVersion = ConfigurationInfo.huskDevice().reqGlEsVersion;
+        return f;
+    }
     public String[] getSystemSharedLibraryNames() { return new String[0]; }
     public int checkPermission(String perm, String pkg) { return PERMISSION_GRANTED; }
     public boolean isPermissionRevokedByPolicy(String perm, String pkg) { return false; }

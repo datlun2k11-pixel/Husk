@@ -209,6 +209,19 @@ static void Display_getDisplayId(tl_jcall *c) { c->ret = vi(0); }
 static void Display_getWidth(tl_jcall *c) { c->ret = vi(H.width); }
 static void Display_getHeight(tl_jcall *c) { c->ret = vi(H.height); }
 static void Display_getName(tl_jcall *c) { c->ret = vl(STR("Built-in Screen")); }
+/* One mode, the screen's own: newer players ask the display for its modes and read the first one. A null answer (the
+ * unimplemented default) is what they then dereference. */
+static void Display_mode(tl_jcall *c)
+{
+    jobj *m = tl_jni_new_object(C("android/view/Display$Mode"));
+    c->ret = vl(m);
+}
+static void Display_getSupportedModes(tl_jcall *c)
+{
+    jobj *a = tl_jni_new_obj_array(C("android/view/Display$Mode"), 1);
+    a->oarr.v[0] = tl_jni_new_object(C("android/view/Display$Mode"));
+    c->ret = vl(a);
+}
 static void WindowManager_getDefaultDisplay(tl_jcall *c) { c->ret = vl(H.display); }
 
 /* ----------------------------------------------------- package information */
@@ -414,6 +427,19 @@ static int g_nonload;
 static pthread_mutex_t g_onload_mu = PTHREAD_MUTEX_INITIALIZER;
 static bool load_native_library(const char *base);
 bool tl_jni_load_library(const char *base) { return load_native_library(base); }
+/*
+ * A library carrying V8 (Cocos Creator's libcocos2djs.so): its JIT asks for code memory both writable and executable, which a phone
+ * never gives, and V8 does not fall back -- the mprotect is refused or the page comes back without write, and the engine dies as it
+ * starts (Top War: SIGBUS in libcocos2djs.so on the GL thread, right after "Initializing V8"). So it is told to run without one before
+ * anything starts it: --jitless, its interpreter and the builtins compiled into the library. TL_V8_JIT=1 leaves V8 as it is.
+ */
+static void v8_jitless(tl_lib *L, const char *base)
+{
+    void (*set_flags)(const char *) = (void (*)(const char *))tl_ld_sym(L, "_ZN2v82V818SetFlagsFromStringEPKc");
+    if (!set_flags || getenv("TL_V8_JIT")) return;
+    set_flags("--jitless");
+    tl_log_line("jni: %s carries V8: told to run without its JIT (--jitless)", base);
+}
 static bool load_native_library(const char *base)
 {
     tl_lib *L = tl_ld_load(base);
@@ -425,6 +451,7 @@ static bool load_native_library(const char *base)
     if (first && g_nonload < 96) g_onload_done[g_nonload++] = L;
     pthread_mutex_unlock(&g_onload_mu);
     if (first) {
+        v8_jitless(L, base);                             /* before its JNI_OnLoad, and so before anything can start V8 */
         /* found as ART's dlsym on the library's handle finds it: in the library or, failing that, in one it needs */
         tl_lib *owner = NULL;
         int32_t (*onload)(void *vm, void *reserved) = (int32_t (*)(void *, void *))tl_ld_sym_deep(L, "JNI_OnLoad", &owner);
@@ -469,6 +496,17 @@ static void SystemClock_elapsedRealtimeNanos(tl_jcall *c) { struct timespec ts; 
 static void System_currentTimeMillis(tl_jcall *c) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); jvalue v; v.j = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000; c->ret = v; }
 static void System_nanoTime(tl_jcall *c) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); jvalue v; v.j = (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec; c->ret = v; }
 static void UnityPlayer_initializeGoogleAr(tl_jcall *c) { c->ret = vz(0); }
+/* Unity 6 loads a plugin through Java (UnityPlayer.loadLibrary -> System.loadLibrary, false on failure), so the plugin's
+ * JNI_OnLoad runs: Firebase keeps the JavaVM it is given there, and without it crashes on its first JNI call. */
+static void UnityPlayer_loadLibrary(tl_jcall *c)
+{
+    const char *n = S(c->args[0].l);
+    size_t l = n ? strlen(n) : 0;
+    char base[200];
+    if (l > 3 && !strcmp(n + l - 3, ".so")) snprintf(base, sizeof(base), "%s", n);
+    else snprintf(base, sizeof(base), "%s%s.so", strncmp(n ? n : "", "lib", 3) ? "lib" : "", n ? n : "");
+    c->ret = vz(n && load_native_library(base));
+}
 
 /* JNIBridge builds Java proxies for interfaces C# implements. A proxy that never answers is
  * enough until something calls through one. */
@@ -878,6 +916,17 @@ static void FMODEx_stop(tl_jcall *c)
 }
 
 static void FMOD_isRunning(tl_jcall *c) { c->ret = vz(g_fmodex.running != 0); }
+/* Unity 6's FMOD asks its Java audio manager (org.fmod.FmodAndroidAudioManager) about Bluetooth and input devices; a NULL
+ * instance stops the engine's loading thread. One manager: no Bluetooth, no microphone, the built-in speaker. */
+static void FmodAM_getInstance(tl_jcall *c)
+{
+    static jobj *one;
+    if (!one) one = make("org/fmod/FmodAndroidAudioManager");
+    c->ret = vl(one);
+}
+static void RetFalse(tl_jcall *c) { c->ret = vz(0); }
+static void RetTrue(tl_jcall *c) { c->ret = vz(1); }
+static void FmodAM_noDevice(tl_jcall *c) { c->ret.i = -1; }
 
 /* ------------------------------------------------------------------ tables */
 
@@ -937,6 +986,9 @@ static void Class_forName(tl_jcall *c)
 static const tl_jhle k_hle[] = {
     M("java/lang/Class", "forName", "(Ljava/lang/String;)Ljava/lang/Class;", Class_forName),
     M("java/lang/Class", "forName", "(Ljava/lang/String;)Ljava/lang/Object;", Class_forName),
+    /* Newer Unity players (2021 and on) look a class up the way Class.forName(String, boolean initialize, ClassLoader)
+     * declares it; the initialize flag and the loader change nothing here, so the one-argument answer serves both. */
+    M("java/lang/Class", "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", Class_forName),
     M("java/lang/System", "load", "(Ljava/lang/String;)V", System_load),
     M("java/lang/System", "loadLibrary", "(Ljava/lang/String;)V", System_loadLibrary),
     M("com/sybogames/chili/migration/KilooPlatformAndroidBridge", "<init>", "()V", Noop),
@@ -1022,6 +1074,8 @@ static const tl_jhle k_hle[] = {
     M("android/view/Display", "getDisplayId", "()I", Display_getDisplayId),
     M("android/view/Display", "getWidth", "()I", Display_getWidth), M("android/view/Display", "getHeight", "()I", Display_getHeight),
     M("android/view/Display", "getName", "()Ljava/lang/String;", Display_getName),
+    M("android/view/Display", "getMode", "()Landroid/view/Display$Mode;", Display_mode),
+    M("android/view/Display", "getSupportedModes", "()[Landroid/view/Display$Mode;", Display_getSupportedModes),
     M("android/view/WindowManager", "getDefaultDisplay", "()Landroid/view/Display;", WindowManager_getDefaultDisplay),
     M("android/content/pm/PackageManager", "getApplicationInfo", "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;", PM_getApplicationInfo),
     M("android/content/pm/PackageManager", "hasSystemFeature", "(Ljava/lang/String;)Z", PM_hasSystemFeature),
@@ -1116,7 +1170,16 @@ static const tl_jhle k_hle[] = {
     M("com/unity3d/player/HFPStatus", "clearHFPStat", "()V", Noop),
     M("org/fmod/FMODAudioDevice", "<init>", "()V", Noop), M("org/fmod/FMODAudioDevice", "start", "()V", FMODEx_start),
     M("org/fmod/FMODAudioDevice", "stop", "()V", FMODEx_stop), M("org/fmod/FMODAudioDevice", "close", "()V", FMODEx_stop), M("org/fmod/FMODAudioDevice", "isRunning", "()Z", FMOD_isRunning),
+    M("org/fmod/FmodAndroidAudioManager", "getInstance", "()Lorg/fmod/FmodAndroidAudioManager;", FmodAM_getInstance),
+    M("org/fmod/FmodAndroidAudioManager", "setUseBluetooth", "(Z)V", Noop), M("org/fmod/FmodAndroidAudioManager", "startBluetoothSco", "()V", Noop),
+    M("org/fmod/FmodAndroidAudioManager", "stopBluetoothSco", "()V", Noop), M("org/fmod/FmodAndroidAudioManager", "isBluetoothScoConnected", "()Z", RetFalse),
+    M("org/fmod/FmodAndroidAudioManager", "isInputSampleRateAvailable", "(I)Z", RetFalse),
+    M("org/fmod/FmodAndroidAudioManager", "isBuiltinInputDeviceAvailable", "()Z", RetFalse),
+    M("org/fmod/FmodAndroidAudioManager", "isBluetoothInputDeviceAvailable", "()Z", RetFalse),
+    M("org/fmod/FmodAndroidAudioManager", "getBluetoothInputDeviceId", "()I", FmodAM_noDevice),
+    M("org/fmod/FmodAndroidAudioManager", "isBuiltinSpeakerDevice", "(I)Z", RetTrue),
     M("com/unity3d/player/UnityPlayer", "initializeGoogleAr", "()Z", UnityPlayer_initializeGoogleAr),
+    M("com/unity3d/player/UnityPlayer", "loadLibrary", "(Ljava/lang/String;)Z", UnityPlayer_loadLibrary),
     M("bitter/jnibridge/JNIBridge", "newInterfaceProxy", "(J[Ljava/lang/Class;)Ljava/lang/Object;", JNIBridge_newInterfaceProxy),
     M("com/unity3d/player/ReflectionHelper", "getConstructorID", "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/reflect/Constructor;", Reflection_getConstructorID),
     M("com/unity3d/player/ReflectionHelper", "getMethodID", "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;Z)Ljava/lang/reflect/Method;", Reflection_getMethodID),

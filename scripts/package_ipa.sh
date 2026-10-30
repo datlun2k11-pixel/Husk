@@ -3,11 +3,14 @@
 #
 # No signing team is needed: AltStore / SideStore re-sign at install with the
 # user's own profile. The IPA is signed ad hoc with Husk.entitlements embedded
-# anyway, because TrollStore keeps the entitlements a binary already carries
-# (RootHelper's signApp reads them from the binary) and invents only
-# get-task-allow for one that has none. Signed this way, the same file gets the
-# memory and dynamic-codesigning entitlements under TrollStore, and a sideloader
-# simply replaces the signature.
+# anyway.
+#
+# When packaging for TrollStore, use the `--trollstore` option (or specify a
+# `.tipa` output). This strips entitlements such as dynamic-codesigning, which
+# cause launch validation failures on devices where PPL/TXM is not disabled.
+# For standard sideloaders, the app is re-signed against a new Apple development
+# provisioning profile, so unsupported entitlements such as dynamic-codesigning
+# are normally not preserved in the final signature.
 #
 # The validation step exists because a bundle missing CFBundleIdentifier or
 # CFBundleExecutable builds and zips perfectly happily, and then fails to install
@@ -88,6 +91,13 @@ if [ -f "$JRT/husk-framework.dex" ]; then
     echo "==> java runtime: $(stat -f '%z bytes, %Sm' "$JRT/husk-framework.dex")"
 fi
 [ -d "$APP" ] || { echo "no app bundle at $APP" >&2; exit 1; }
+# Android libraries made into dylibs ahead of time (Husk 3.2's JIT-less mode; tools/elf2macho-test.c <lib.so> build/aot/ --ios):
+# they go in Frameworks, where every installer signs them with the app.
+AOT="$HUSK_ROOT/build/aot"
+if ls "$AOT"/aot-*.dylib >/dev/null 2>&1; then
+    cp "$AOT"/aot-*.dylib "$APP/Frameworks/"
+    echo "==> JIT-less dylibs: $(ls "$AOT"/aot-*.dylib | wc -l | tr -d ' ') ($(du -ch "$AOT"/aot-*.dylib | tail -1 | cut -f1))"
+fi
 
 # Stamp the build's identity into the bundle so its logs can name themselves.
 # A log from a stale install is otherwise indistinguishable from a log proving a
@@ -182,6 +192,8 @@ cp -R "$APP" "$STAGE/Payload/"
 ENT_BASE="$HUSK_ROOT/src/app/Husk/Husk.entitlements"
 ENT="$STAGE/entitlements.plist"
 cp "$ENT_BASE" "$ENT"
+# Entitlements that cause launch crashes on TrollStore under PPL/TXM
+# (see https://github.com/opa334/TrollStore#banned-entitlements).
 BANNED_KEYS=(
     "com.apple.private.cs.debugger"
     "dynamic-codesigning"

@@ -44,6 +44,7 @@ void husk_ios_jit_install_trap_handler(void);
 /* Claim the JIT region while StikDebug is still attached, before the guest
    download. Pass the same size QEMU will ask for (tb-size). */
 bool husk_ios_jit_prewarm(size_t bytes);
+bool husk_ios_jit_prewarm_self(size_t bytes);
 bool husk_ios_jit_is_available(void);
 /* Whether a plain MAP_JIT mapping executes in this process -- the second of the
  * two routes to executable memory, measured rather than predicted. */
@@ -113,5 +114,10 @@ void husk_balloon_set_bytes(int64_t target_bytes);
 #include "../../translation-layer-next/husk-console-host.h"
 /* Settings > Network Bridge: the phone's own network, told to the guest (husk-tl-netcfg.c). */
 #include "../../translation-layer-next/husk-tl-netcfg.h"
+
+/* Husk 3.2's JIT-less mode (JITLess.swift, SigningCertificate.swift): libraries made into signed dylibs ahead of time. */
+void tl_ld_set_aot_dir(const char *dir);
+#include "../../translation-layer-next/husk-tl-aot.h"
+#include "../../translation-layer-next/husk-tl-codesign.h"
 
 #endif /* HUSK_BRIDGE_H */

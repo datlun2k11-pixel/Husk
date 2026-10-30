@@ -90,6 +90,20 @@ struct AppDiagnosis: Identifiable, Equatable {
                                 evidence: l)
         }
 
+        // iOS closed Husk for memory: the runtime's last readings ("N MiB left before jetsam") had fallen to almost nothing. Checked
+        // before what the log said earlier in the run, which may only be a warning (#175: an OBB note, then an out-of-memory end).
+        let left = lines.suffix(40).compactMap { l -> Int? in
+            guard let r = l.range(of: " MiB left before jetsam") else { return nil }
+            return Int(l[..<r.lowerBound].split(separator: " ").last ?? "")
+        }
+        if let last = left.last, last < 80 {
+            return AppDiagnosis(kind: .noProgress, title: "Ran out of memory",
+                                detail: "iOS closed Husk because the game used all the memory it allows an app (\(last) MiB were left). "
+                                    + "Close other apps and try again; lower graphics settings in the game help. On SideStore or AltStore, "
+                                    + "GetMoreRam raises the limit.",
+                                evidence: lines.last { $0.contains("left before jetsam") })
+        }
+
         // The JIT region is shared: Android (QEMU) holds its top half while it runs, an app's libraries fill it from the bottom
         if let l = lines.first(where: { $0.contains("but QEMU holds its top") || $0.contains("of TCG") && $0.contains("no room for") }) {
             return AppDiagnosis(kind: .noJIT, title: "Not enough JIT memory",

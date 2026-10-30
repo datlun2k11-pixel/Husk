@@ -113,6 +113,8 @@ static int safe_read(uintptr_t addr, void *out, size_t n)
     return vm_read_overwrite(mach_task_self(), (vm_address_t)addr, n, (vm_address_t)out, &got) == KERN_SUCCESS && got == n;
 }
 
+void tl_egl_recent_calls(char *out, size_t n, int count);
+void tl_egl_gl_histogram(char *out, size_t cap);
 static void on_crash(int sig, siginfo_t *info, void *uctx)
 {
     ucontext_t *uc = uctx;
@@ -132,6 +134,8 @@ static void on_crash(int sig, siginfo_t *info, void *uctx)
     for (int i = 0; i < 29; i += 4)
         fprintf(stderr, "  x%d=%#llx x%d=%#llx x%d=%#llx x%d=%#llx\n", i, ss->__x[i], i + 1, ss->__x[i + 1], i + 2, i + 2 < 29 ? ss->__x[i + 2] : 0, i + 3, i + 3 < 29 ? ss->__x[i + 3] : 0);
     fprintf(stderr, "  sp=%#llx fp=%#llx\n", ss->__sp, ss->__fp);
+    { char gl[2048]; tl_egl_recent_calls(gl, sizeof(gl), 40); if (gl[0]) fprintf(stderr, "  last GL calls: %s\n", gl); }
+    { static char h[1024 * 48]; tl_egl_gl_histogram(h, sizeof(h)); if (h[0]) fprintf(stderr, "  GL calls by function: %s\n", h); }
     uint64_t dump_base = getenv("TL_CRASH_DUMP_REG") ? ss->__x[atoi(getenv("TL_CRASH_DUMP_REG"))] : ss->__x[0];
     for (int i = 0; i < 0x120; i += 16) {
         uint64_t q[2];

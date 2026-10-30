@@ -104,10 +104,31 @@ struct NavigationStack<Root: View>: View {
         if #available(iOS 16, *) {
             modern()
         } else {
-            NavigationView {
-                root.background(HuskNavigationLevel(level: 0, navigation: navigation))
+            // iOS 15 (#159, #181): hidden NavigationLinks (isActive) pushed empty screens there, so the top of the path is shown
+            // instead, in a navigation view of its own over the root, with a Back button that pops it
+            ZStack {
+                NavigationView { root }
+                    .navigationViewStyle(.stack)
+                if let top = navigation.path.last {
+                    NavigationView {
+                        navigation.screen(for: top)
+                            .toolbar {
+                                ToolbarItem(placement: .navigationBarLeading) {
+                                    Button { navigation.setPath(Array(navigation.path.dropLast())) } label: {
+                                        Label("Back", systemImage: "chevron.left").labelStyle(.titleAndIcon)
+                                    }
+                                }
+                            }
+                            .environment(\.huskNavigation, navigation)
+                    }
+                    .navigationViewStyle(.stack)
+                    .background(Console.page.ignoresSafeArea())
+                    .id(navigation.path.count)
+                    .transition(.move(edge: .trailing))
+                    .zIndex(Double(navigation.path.count))
+                }
             }
-            .navigationViewStyle(.stack)
+            .animation(.easeOut(duration: 0.25), value: navigation.path.count)
             .environment(\.huskNavigation, navigation)
             .onAppear {
                 if let pathGet, let pathSet {
@@ -289,5 +310,36 @@ extension Locale {
     var huskRegionCode: String? {
         if #available(iOS 16, *) { return region?.identifier }
         return regionCode
+    }
+}
+
+// MARK: - pages
+
+/// A page's List on Husk's navy: the page colour behind it and cards for its rows (iOS 15 keeps the system's grouped
+/// background, which it cannot hide).
+struct HuskPageList<Content: View>: View {
+    @ViewBuilder var content: Content
+    var body: some View {
+        if #available(iOS 16, *) {
+            List { Group { content }.listRowBackground(Console.card) }
+                .scrollContentBackground(.hidden)
+                .background(Console.page.ignoresSafeArea())
+        } else {
+            List { content }
+        }
+    }
+}
+
+/// The same for a Form: settings pages on the navy too.
+struct HuskForm<Content: View>: View {
+    @ViewBuilder var content: Content
+    var body: some View {
+        if #available(iOS 16, *) {
+            Form { Group { content }.listRowBackground(Console.card) }
+                .scrollContentBackground(.hidden)
+                .background(Console.page.ignoresSafeArea())
+        } else {
+            Form { content }
+        }
     }
 }

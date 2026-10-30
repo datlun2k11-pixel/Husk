@@ -1051,6 +1051,7 @@ static void jni_ReleaseStringCritical(void *env, jo s, const uint16_t *c) { jni_
 /* --- natives, monitors, misc --- */
 
 typedef struct { const char *name, *sig; void *fn; } native_method;
+static unsigned g_natives_generation;
 
 static int32_t jni_RegisterNatives(void *env, jo cls, const native_method *m, int32_t n)
 {
@@ -1073,8 +1074,11 @@ static int32_t jni_RegisterNatives(void *env, jo cls, const native_method *m, in
         TRACE("jni: RegisterNatives %s.%s%s -> %p", c->name, m[i].name, m[i].sig, m[i].fn);
     }
     pthread_mutex_unlock(&g_lock);
+    __atomic_add_fetch(&g_natives_generation, 1, __ATOMIC_RELEASE);
     return 0;
 }
+/* Bumped by every RegisterNatives: a method's cached native is looked up again after one (a later registration wins, as in ART). */
+unsigned tl_jni_natives_generation(void) { return __atomic_load_n(&g_natives_generation, __ATOMIC_ACQUIRE); }
 static int32_t jni_UnregisterNatives(void *env, jo cls) { (void)env; (void)cls; return 0; }
 
 void *tl_jni_native(const char *cls, const char *name, const char *sig)
