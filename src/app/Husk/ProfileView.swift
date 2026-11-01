@@ -19,8 +19,9 @@ struct ProfileView: View {
             .background(Console.page.ignoresSafeArea())
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
-                if account.signedIn {
-                    ToolbarItem(placement: .primaryAction) {
+                // The condition is inside the item: ToolbarContentBuilder's buildIf is iOS 16, this target is 15.5.
+                ToolbarItem(placement: .primaryAction) {
+                    if account.signedIn {
                         Menu {
                             Button { editing = true } label: { Label("Edit Profile", systemImage: "pencil") }
                             if let u = account.user {
