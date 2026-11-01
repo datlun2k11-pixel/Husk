@@ -111,7 +111,6 @@ public final class Services {
         case Context.JOB_SCHEDULER_SERVICE: return new android.app.job.JobScheduler.Impl();
         case Context.APP_OPS_SERVICE: return new android.app.AppOpsManager();
         case Context.INPUT_SERVICE: return new android.hardware.input.InputManager();
-        case Context.WIFI_SERVICE: return new android.net.wifi.WifiManager(c, null);
         case Context.LOCATION_SERVICE: return new android.location.LocationManager(c, null);
         default: return null;
         }
