@@ -33,8 +33,9 @@ jobj *tl_hle_assets(void);
 /* The stream itself (a tl_astream) is the native state of the InputStream and of its channel; both hold it,
  * so it is reference counted (a channel made from a stream keeps the same bytes at the same position). */
 
-/* The stream behind every asset InputStream and channel: the APKs' entry, one window at a time. */
-struct tl_astream { tl_zip_stream *zs; int refs; };
+/* The stream behind every asset InputStream and channel: the APKs' entry, one window at a time.
+ * A boot.config patched for JIT-less play is held whole instead (mem, len, pos). */
+struct tl_astream { tl_zip_stream *zs; int refs; uint8_t *mem; size_t len, pos; };
 
 tl_astream *tl_astream_open(const char *name)
 {
@@ -49,8 +50,24 @@ tl_astream *tl_astream_open(const char *name)
         if (!zs) { tl_log_line("assets: %s: %s", name ? name : "?", err); return NULL; }
         tl_astream *s = calloc(1, sizeof(*s));
         if (!s) { tl_zip_stream_close(zs); return NULL; }
-        s->zs = zs;
         s->refs = 1;
+        /* Unity 6's Mimalloc aborts under AOT: its arena trim munmaps huge reservations that
+         * can overlap dylibs. The Dynamic Heap allocator does not. */
+        if (getenv("TL_NO_XMEM") && name && strstr(name, "boot.config")) {
+            size_t n = (size_t)tl_zip_stream_len(zs);
+            const uint8_t *d = tl_zip_stream_whole(zs, err, sizeof(err));
+            if (!d) { tl_zip_stream_close(zs); free(s); tl_log_line("assets: %s: %s", name, err); return NULL; }
+            static const char extra[] = "\nmemorysetup-main-allocator-mimalloc-enabled=0\n";
+            size_t add = memmem(d, n, "memorysetup-main-allocator-mimalloc-enabled=0", 45) ? 0 : sizeof(extra) - 1;
+            uint8_t *b = malloc(n + add ? n + add : 1);
+            if (!b) { tl_zip_stream_close(zs); free(s); return NULL; }
+            memcpy(b, d, n);
+            if (add) { memcpy(b + n, extra, add); tl_log_line("unity: boot.config: Mimalloc disabled (JIT-less)"); }
+            tl_zip_stream_close(zs);                        /* s->whole points into it: copy made above */
+            s->mem = b; s->len = n + add;
+            return s;
+        }
+        s->zs = zs;
         return s;
     }
 }
@@ -62,16 +79,24 @@ tl_astream *tl_astream_retain(tl_astream *s)
 uint64_t tl_astream_read(tl_astream *s, void *buf, uint64_t n)
 {
     if (!s || !n) return n ? (uint64_t)-1 : 0;
+    if (s->mem) {
+        size_t left = s->len - s->pos;
+        size_t r = n < left ? (size_t)n : left;
+        memcpy(buf, s->mem + s->pos, r);
+        s->pos += r;
+        return r;
+    }
     size_t r = tl_zip_stream_read(s->zs, buf, n > SIZE_MAX ? SIZE_MAX : (size_t)n, NULL, 0);
     return r == (size_t)-1 ? (uint64_t)-1 : (uint64_t)r;
 }
-int64_t tl_astream_len(const tl_astream *s) { return s ? (int64_t)tl_zip_stream_len(s->zs) : -1; }
-int64_t tl_astream_pos(const tl_astream *s) { return s ? (int64_t)tl_zip_stream_pos(s->zs) : 0; }
+int64_t tl_astream_len(const tl_astream *s) { return !s ? -1 : s->mem ? (int64_t)s->len : (int64_t)tl_zip_stream_len(s->zs); }
+int64_t tl_astream_pos(const tl_astream *s) { return !s ? 0 : s->mem ? (int64_t)s->pos : (int64_t)tl_zip_stream_pos(s->zs); }
 void tl_astream_close(tl_astream *s)
 {
     if (!s) return;
     if (__atomic_sub_fetch(&s->refs, 1, __ATOMIC_ACQ_REL) != 0) return;   /* a channel may still hold it */
     tl_zip_stream_close(s->zs);
+    free(s->mem);
     free(s);
 }
 

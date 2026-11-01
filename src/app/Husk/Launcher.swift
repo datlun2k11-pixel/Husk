@@ -303,7 +303,7 @@ struct HomeView: View {
             if let busy = store.busy { BusyStrip(text: busy) }
             if let busy = host.busy { BusyStrip(text: busy) }
             DownloadsNotice()
-            if !Launcher.jitOn { JITNotice() }
+            if !Launcher.jitOn && !JITLess.enabled { JITNotice() }
         }
     }
 }
@@ -568,6 +568,7 @@ private struct HomeAvatar: View {
 /// JIT is off: say so, and the way to turn it on.
 private struct JITNotice: View {
     @ObservedObject private var jit = JITCoordinator.shared
+    @ObservedObject private var router = Router.shared
 
     static func via(_ jit: JITCoordinator) -> String {
         let m = jit.resolvedMethod
@@ -587,11 +588,7 @@ private struct JITNotice: View {
                     Image(systemName: "bolt.fill")
                         .font(.system(size: 14, weight: .bold))
                         .foregroundStyle(.orange)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("JIT is off").font(.system(size: 14, weight: .semibold)).foregroundStyle(.white)
-                        Text(jit.busy ? (jit.status ?? "Turning on…") : "Games need it. Tap to turn it on.")
-                            .font(.system(size: 12)).foregroundStyle(Console.textDim).lineLimit(1)
-                    }
+                    Text("JIT is off").font(.system(size: 14, weight: .semibold)).foregroundStyle(.white)
                     Spacer(minLength: 0)
                     if jit.busy { ProgressView() } else {
                         Text("Turn On")
@@ -607,6 +604,16 @@ private struct JITNotice: View {
             }
             .buttonStyle(CardButtonStyle())
             .disabled(jit.busy)
+            Button { router.tab = .settings } label: {
+                Text("Play without JIT")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Console.hairline, lineWidth: 0.5))
+            }
+            .buttonStyle(CardButtonStyle())
             if let error = jit.error {
                 Text(error).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
             }

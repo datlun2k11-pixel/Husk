@@ -116,6 +116,17 @@ struct ContentView: View {
                     }
             }
 
+            if confirmAndroid {
+                ZStack {
+                    Color.black.opacity(0.55).ignoresSafeArea()
+                    AndroidStartWarning(
+                        onStart: { confirmAndroid = false; startFromLibrary() },
+                        onCancel: { confirmAndroid = false }
+                    )
+                }
+                .zIndex(20)
+            }
+
         }
         .tint(theme.accentColor)
         // The user's appearance: the system's, unless they pinned one. Set on the
@@ -134,13 +145,6 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showLogs) { LogView() }
-        .alert("Start Android?", isPresented: $confirmAndroid) {
-            Button("Start") { startFromLibrary() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Full Android emulation is experimental. It is slow, takes minutes to start, and can freeze or crash Husk. "
-               + "Games and apps run much better in the Translation Layer.")
-        }
         // A game that ended Husk last time: say so, with its report.
         .sheet(item: Binding(get: { showOnboarding ? nil : crash.pending }, set: { crash.pending = $0 }),
                onDismiss: { if WhatsNew.due { showWhatsNew = true } }) { r in
@@ -703,6 +707,40 @@ struct ControlsSheet: View {
         }
         .padding(.horizontal, 14).padding(.vertical, 12)
         .contentShape(Rectangle())
+    }
+}
+
+/// Full Android start: they have to sit through the warning. A normal alert is one tap and people skip it.
+private struct AndroidStartWarning: View {
+    var onStart: () -> Void
+    var onCancel: () -> Void
+    @State private var wait = 5
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Start Android?").font(.title2.weight(.bold))
+            Text("This is the emulator. It's slow and it crashes. Don't use it for games.")
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                Button("Cancel", action: onCancel)
+                Spacer()
+                Button(wait > 0 ? "Wait \(wait)" : "Start") { onStart() }
+                    .disabled(wait > 0)
+                    .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(22)
+        .frame(maxWidth: 360)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .padding(.horizontal, 28)
+        .task {
+            while wait > 0 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if Task.isCancelled { return }
+                wait -= 1
+            }
+        }
     }
 }
 

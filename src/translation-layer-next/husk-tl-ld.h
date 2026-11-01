@@ -37,6 +37,8 @@ typedef struct tl_lib tl_lib;
 /* Where libraries come from: the APKs' lib/arm64-v8a/ directories. */
 #define TL_LD_MAX_APKS 48   /* a big game ships a dozen asset-pack splits besides its config ones (Disney Speedstorm: 16) */
 bool tl_ld_add_apk(const char *path);
+/* Forget the current app's APKs and libraries so another app can load. Runtime (system) libraries stay. */
+void tl_ld_reset_session(void);
 /* A split APK of the app about to start; added right after its base APK, whichever engine adds that. */
 void tl_ld_queue_split(const char *path);
 const char *tl_ld_queued_split(int index);              /* NULL past the last */
@@ -50,6 +52,7 @@ void tl_ld_interpose(const char *name, void *fn);
 
 /* Whether one of the APKs carries this arm64 library (an engine is told by the libraries it ships). */
 bool tl_ld_has_lib(const char *name);
+bool tl_ld_is_arm32(const tl_lib *lib);
 int tl_ld_apk_libs(void (*cb)(const char *name, uint64_t size, void *user), void *user);
 
 /*
@@ -64,6 +67,9 @@ void tl_ld_add_search_dir(const char *dir);
 
 /* Run constructors for a library and anything it needs that has not run. */
 bool tl_ld_init(tl_lib *lib);
+/* After that library's constructors: Unity installs IL2CPP's terminate handler here, because
+ * NativeLoader.load often returns before libil2cpp.so exists. */
+void tl_ld_on_init(void (*fn)(tl_lib *lib));
 
 /* A library already loaded, by file name or soname. */
 tl_lib *tl_ld_find_lib(const char *name);
@@ -77,6 +83,20 @@ tl_lib *tl_ld_lib_of(const void *addr);
 void *tl_ld_lib_base(const tl_lib *lib);
 const char *tl_ld_lib_name(const tl_lib *lib);
 const char *tl_ld_symbol_at(const void *addr, const char **lib_name, const void **sym_addr);
+
+/* An imported AOT dylib maps the ELF image r-x (AMFI execSeg). Stores that land there belong on the writable copy of that
+ * page, if the loader made one. NULL if `addr` is not in such a page. Safe to call from a fault handler after libraries
+ * have loaded. */
+void *tl_ld_aot_writable(const void *addr, size_t bytes);
+/* True when `addr` is inside an imported AOT image (including its stub pages). mprotect there cannot change permissions. */
+bool tl_ld_aot_contains(const void *addr);
+/* True when any byte of [addr, addr+bytes) is a loaded library (AOT dylib or JIT image, either view).
+ * mmap(MAP_FIXED)/munmap/madvise must not treat that as anonymous heap. */
+bool tl_ld_covers(const void *addr, size_t bytes);
+/* If `addr` is a fetch from the writable copy of a function (relative C++ vtables
+ * add a slot offset to a vtable that lives in the copy, which lands in the copy of
+ * .text, which is not executable), the executable view of the same offset; otherwise NULL. */
+void *tl_ld_aot_exec(const void *addr);
 
 /*
  * Walk loaded libraries the way dl_iterate_phdr does. The callback gets the load
@@ -138,7 +158,7 @@ bool tl_ld_aot_build(const char *name, const uint8_t *file, size_t flen, tl_ld_a
 /* What a dylib made from a library records about it (section __TEXT,__husk_manifest), so the loader only imports a dylib that was
  * made from this exact file by a compatible loader. */
 #define TL_AOT_MAGIC   "HUSKAOT1"
-#define TL_AOT_VERSION 4u          /* bump whenever the rewrites or the dylib's layout change: an old dylib must not be imported */
+#define TL_AOT_VERSION 9u          /* bump whenever the rewrites or the dylib's layout change: an old dylib must not be imported */
 typedef struct tl_aot_manifest {
     char magic[8];
     uint32_t version, page;            /* TL_AOT_VERSION; 16384 */

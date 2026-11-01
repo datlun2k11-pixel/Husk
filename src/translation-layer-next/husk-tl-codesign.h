@@ -57,13 +57,16 @@ bool husk_p12_info(const uint8_t *p12, size_t p12_len, const char *password,
  *   p12              - Pointer to .p12 bundle data (or NULL for ad-hoc).
  *   p12_len          - Length of .p12 bundle data (or 0 for ad-hoc).
  *   password         - Passphrase for the .p12 bundle.
+ *   ident            - CodeDirectory identifier and designated-requirement ident. On iOS this must be the running app's
+ *                      bundle ID (SideStore/AltStore rewrite it, TrollStore/enterprise may not). NULL uses the dylib's
+ *                      install-name basename (Mac tests). LC_ID_DYLIB is left unique for dyld.
  *   err              - Output buffer for error description on failure.
  *   errlen           - Size of err buffer in bytes.
  *
  * Returns true on success, false on failure (with error in err).
  */
 bool husk_codesign_dylib(const char *path, const uint8_t *p12, size_t p12_len, const char *password,
-                         char *err, size_t errlen);
+                         const char *ident, char *err, size_t errlen);
 
 /*
  * Take the certificates from the code signature of the executable at `path` (the app itself: its installer signed it with the

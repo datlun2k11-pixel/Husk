@@ -48,16 +48,14 @@ bool tl_aot_make_dylib(const char *name, const uint8_t *file, size_t flen, const
     FILE *f = NULL;
     char tmp[1100]; snprintf(tmp, sizeof(tmp), "%s.part", out_path);
 
-    /* The dylib maps each page at the vaddr it has in the image, file offset equal to vaddr: a run of executable pages in a __TEXT
-     * segment and a run of data pages in a __DATA one. So a data page is writable at the very address the code computes for it, and
-     * no page has to be executable and writable at once, which is what iOS refuses to remap. */
-    struct { uint64_t off, len; bool exec; } run[128]; int nruns = 0;
-    for (size_t p = 0; p < NP && A.page_class; ) {
-        bool e = (A.page_class[p] & 1) != 0;
-        size_t q = p; while (q < NP && ((A.page_class[q] & 1) != 0) == e) q++;
-        if (nruns == 128) { snprintf(err, errlen, "the library's pages alternate too often to lay them out"); goto out; }
-        run[nruns].off = (uint64_t)p * PAGE; run[nruns].len = (uint64_t)(q - p) * PAGE; run[nruns].exec = e; nruns++;
-        p = q;
+    /* LiveContainer/ZSign sign ld-style Mach-Os: one r-x __TEXT, then rw- __DATA, then __LINKEDIT. AMFI's execSeg is that __TEXT
+     * range; a hole of non-executable pages in it is `code signature invalid` on iOS 27, and a segment named __DATA that is not
+     * writable is rejected by dyld. The image keeps its vaddrs (file offset = vaddr) so the loader can still use one pointer.
+     * Data pages in the image are r-x like const data in __TEXT; their writable copies (page_class bit 2) live after it. The slot
+     * and thread-block pages at the end of the image stay rw- __DATA, past execSeg. */
+    const uint64_t text_file = HDR + (uint64_t)(A.npages + A.nstub) * PAGE; /* header + image + stubs; slots follow */
+    if (text_file < HDR + PAGE || text_file + 2 * PAGE != HDR + S) {
+        snprintf(err, errlen, "the image layout does not split into __TEXT then __DATA"); goto out;
     }
     /* A library built for 4 KiB pages has pages that hold code and writable data both: the writable copies of its data pages follow
      * the image, at the image's size plus the page's index, which is where the rewritten data accesses name them (mixed_page in
@@ -79,8 +77,8 @@ bool tl_aot_make_dylib(const char *name, const uint8_t *file, size_t flen, const
     const uint64_t dup_vm = HDR + S;                        /* page p's copy: dup_vm + p * PAGE */
     const uint64_t link_vm = ncopy ? dup_vm + (uint64_t)(copy[ncopy - 1].last + 1) * PAGE : dup_vm;
     const uint64_t link_file = HDR + S + copy_file;
-    const uint32_t nseg = (uint32_t)nruns + 2 + (uint32_t)ncopy;     /* __TEXT (the header page), the runs, the copies, __LINKEDIT */
-    if (nruns + 2 + ncopy > 200) { snprintf(err, errlen, "the library needs too many segments to lay out"); goto out; }
+    const uint32_t nseg = 3 + (uint32_t)ncopy;     /* __TEXT, __DATA (slots), the copies, __LINKEDIT */
+    if (ncopy + 3 > 200) { snprintf(err, errlen, "the library needs too many segments to lay out"); goto out; }
 
     /* __LINKEDIT: chained-fixups header with no fixups, an empty export trie, an empty string table */
     struct dyld_chained_fixups_header fh = {0};
@@ -98,21 +96,17 @@ bool tl_aot_make_dylib(const char *name, const uint8_t *file, size_t flen, const
     const uint32_t str_off = (uint32_t)L.n; const uint8_t strs[8] = { ' ', 0 }; put(&L, strs, 8);
     (void)imports_off;
 
-    /* load commands: the header page, a segment per run, __LINKEDIT */
+    /* load commands: one __TEXT covering the header, the image and the stubs (ld-style), then rw- __DATA */
     struct segment_command_64 text = { LC_SEGMENT_64, sizeof(struct segment_command_64) + sizeof(struct section_64), "__TEXT",
-        0, HDR, 0, HDR, VM_PROT_READ | VM_PROT_EXECUTE, VM_PROT_READ | VM_PROT_EXECUTE, 1, 0 };
+        0, text_file, 0, text_file, VM_PROT_READ | VM_PROT_EXECUTE, VM_PROT_READ | VM_PROT_EXECUTE, 1, 0 };
     struct section_64 man = { "__husk_manifest", "__TEXT", MANIFEST_AT, sizeof(tl_aot_manifest), (uint32_t)MANIFEST_AT, 3, 0, 0,
         S_REGULAR, 0, 0, 0 };
     put(&C, &text, sizeof(text)); put(&C, &man, sizeof(man));
-    int nexec = 0, ndata = 0;
-    for (int r = 0; r < nruns; r++) {
-        struct segment_command_64 sg = { LC_SEGMENT_64, sizeof(struct segment_command_64), "",
-            HDR + run[r].off, run[r].len, HDR + run[r].off, run[r].len, 0, 0, 0, 0 };
-        sg.maxprot = sg.initprot = run[r].exec ? (VM_PROT_READ | VM_PROT_EXECUTE) : (VM_PROT_READ | VM_PROT_WRITE);
-        if (run[r].exec) { snprintf(sg.segname, sizeof(sg.segname), nexec ? "__TEXT_EXEC_%d" : "__TEXT_EXEC", nexec); nexec++; }
-        else { snprintf(sg.segname, sizeof(sg.segname), ndata ? "__DATA_%d" : "__DATA", ndata); ndata++; }
-        put(&C, &sg, sizeof(sg));
-    }
+    int ndata = 0;
+    struct segment_command_64 slots = { LC_SEGMENT_64, sizeof(struct segment_command_64), "__DATA",
+        text_file, 2 * PAGE, text_file, 2 * PAGE, VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, 0, 0 };
+    put(&C, &slots, sizeof(slots));
+    ndata = 1;
     for (int c = 0; c < ncopy; c++) {
         struct segment_command_64 sg = { LC_SEGMENT_64, sizeof(struct segment_command_64), "",
             dup_vm + (uint64_t)copy[c].first * PAGE, (uint64_t)(copy[c].last - copy[c].first + 1) * PAGE,
@@ -122,7 +116,6 @@ bool tl_aot_make_dylib(const char *name, const uint8_t *file, size_t flen, const
         ndata++;
         put(&C, &sg, sizeof(sg));
     }
-    if (nexec < 1) { snprintf(err, errlen, "the library has no executable pages"); goto out; }
     struct segment_command_64 link = { LC_SEGMENT_64, sizeof(struct segment_command_64), "__LINKEDIT",
         link_vm, ROUND_UP(L.n), link_file, L.n, VM_PROT_READ, VM_PROT_READ, 0, 0 };
     put(&C, &link, sizeof(link));
@@ -238,7 +231,7 @@ static bool is_arm64_elf(const uint8_t *p, size_t n)
 /* Converts one library into the cache, or leaves a non-library alone. 1 = done (or already there), 0 = not a library,
  * -1 = failed (err has the reason). */
 static int prepare_one(const char *name, const uint8_t *data, size_t len, const char *cache_dir, const uint8_t *p12,
-                       size_t p12_len, const char *password, const char *cert_tag, char *err, size_t errlen)
+                       size_t p12_len, const char *password, const char *cert_tag, const char *sign_ident, char *err, size_t errlen)
 {
     if (!is_arm64_elf(data, len)) {
         tl_log_line("aot: %s is not an arm64 ELF library, left alone", name);
@@ -258,7 +251,7 @@ static int prepare_one(const char *name, const uint8_t *data, size_t len, const 
         tl_log_line("aot: converting %s (%zu KiB)", name, len >> 10);
         ok = tl_aot_make_dylib(name, data, len, path, TARGET_OS_IPHONE, NULL, e2, sizeof(e2));   /* for the platform this runs on */
         if (ok) {
-            ok = husk_codesign_dylib(path, p12, p12_len, password, e2, sizeof(e2));
+            ok = husk_codesign_dylib(path, p12, p12_len, password, sign_ident, e2, sizeof(e2));
             if (ok && cert_tag) write_text(signer, cert_tag);
             if (ok) tl_log_line("aot: %s signed", name);
         }
@@ -278,7 +271,7 @@ static size_t tar_octal(const uint8_t *p, size_t n)
     return v;
 }
 static int prepare_tar(const uint8_t *t, size_t n, const char *what, const char *cache_dir, const uint8_t *p12, size_t p12_len,
-                       const char *password, const char *cert_tag, char *err, size_t errlen)
+                       const char *password, const char *cert_tag, const char *sign_ident, char *err, size_t errlen)
 {
     int done = 0; size_t off = 0; char longname[256] = "";
     while (off + 512 <= n) {
@@ -301,9 +294,9 @@ static int prepare_tar(const uint8_t *t, size_t n, const char *what, const char 
             const char *base = strrchr(name, '/'); base = base ? base + 1 : name;
             size_t bl = strlen(base);
             if (bl > 3 && !strcmp(base + bl - 3, ".so") && is_arm64_elf(t + off, size)) {
-                int r = prepare_one(base, t + off, size, cache_dir, p12, p12_len, password, cert_tag, err, errlen);
-                if (r < 0) return -1;
-                done += r;
+                int r = prepare_one(base, t + off, size, cache_dir, p12, p12_len, password, cert_tag, sign_ident, err, errlen);
+                if (r < 0) { tl_log_line("aot: %s skipped: %s", base, err); if (errlen) err[0] = 0; }
+                else done += r;
             }
         }
         off += (size + 511) & ~(size_t)511;
@@ -313,9 +306,9 @@ static int prepare_tar(const uint8_t *t, size_t n, const char *what, const char 
 }
 
 int husk_aot_prepare(const char *const *apks, int napks, const char *cache_dir, const uint8_t *p12, size_t p12_len,
-                     const char *password, const char *cert_tag, tl_aot_progress_fn progress, void *user, char *err, size_t errlen)
+                     const char *password, const char *cert_tag, const char *sign_ident, tl_aot_progress_fn progress, void *user,
+                     char *err, size_t errlen)
 {
-    static const char prefix[] = "lib/arm64-v8a/";
     mkdir(cache_dir, 0755);
     tl_zip *z = calloc((size_t)(napks > 0 ? napks : 1), sizeof(tl_zip));
     if (!z) { snprintf(err, errlen, "out of memory"); return -1; }
@@ -338,8 +331,14 @@ int husk_aot_prepare(const char *const *apks, int napks, const char *cache_dir, 
         for (size_t i = 0; i < z[a].count; i++) {
             const char *n = z[a].entries[i].name;
             size_t l = strlen(n);
-            if (strncmp(n, prefix, sizeof(prefix) - 1) || l < sizeof(prefix) + 3 || strcmp(n + l - 3, ".so") || strchr(n + sizeof(prefix) - 1, '/')) continue;
-            const char *base = n + sizeof(prefix) - 1;
+            static const char *const prefixes[] = { "lib/arm64-v8a/", "lib/arm64/" };
+            const char *base = NULL;
+            for (int p = 0; p < 2 && !base; p++) {
+                size_t pl = strlen(prefixes[p]);
+                if (l > pl + 3 && !strncmp(n, prefixes[p], pl) && !strcmp(n + l - 3, ".so") && !strchr(n + pl, '/'))
+                    base = n + pl;
+            }
+            if (!base) continue;
             bool seen = false;
             for (int k = 0; k < nlibs && !seen; k++) seen = !strcmp(libs[k].name, base);
             if (seen) continue;
@@ -372,15 +371,20 @@ int husk_aot_prepare(const char *const *apks, int napks, const char *cache_dir, 
         }
         int r;
         if (is_arm64_elf(data, len))
-            r = prepare_one(libs[k].name, data, len, cache_dir, p12, p12_len, password, cert_tag, err, errlen);
+            r = prepare_one(libs[k].name, data, len, cache_dir, p12, p12_len, password, cert_tag, sign_ident, err, errlen);
         else if (len > 512 && !memcmp(data + 257, "ustar", 5))
-            r = prepare_tar(data, len, libs[k].name, cache_dir, p12, p12_len, password, cert_tag, err, errlen);
+            r = prepare_tar(data, len, libs[k].name, cache_dir, p12, p12_len, password, cert_tag, sign_ident, err, errlen);
         else {
             tl_log_line("aot: %s is not an arm64 ELF library, left alone", libs[k].name);
             r = 0;
         }
         if (owned) free((void *)data);
-        if (r < 0) { ready = -1; goto out; }
+        if (r < 0) {
+            /* one library that will not convert must not stop the rest: JIT-less still runs on those that did */
+            tl_log_line("aot: %s skipped: %s", libs[k].name, err);
+            if (errlen) err[0] = 0;
+            continue;
+        }
         ready += r;
     }
     if (progress) progress(user, nlibs, nlibs, NULL);

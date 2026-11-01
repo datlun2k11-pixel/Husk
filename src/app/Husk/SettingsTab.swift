@@ -21,12 +21,9 @@ struct SettingsTab: View {
                     }
                 }
 
-                Section {
+                Section("JIT") {
                     row(JITSettings(), "bolt.fill", .yellow, "JIT & Sideload", "StikJIT is built in — the recommended way")
-                } header: {
-                    Text("JIT")
-                } footer: {
-                    Text("Android and Translation Layer games need JIT. StikJIT, built into Husk, turns it on without a computer.")
+                    row(JITLessSettings(), "bolt.slash.fill", .mint, "Play without JIT", "No debugger")
                 }
 
                 Section("General") {
@@ -109,9 +106,6 @@ struct SettingsTab: View {
                     row(SavedMachineSettings(), "externaldrive.fill", .teal, "Saved Machine", "Snapshots and automatic saving")
                 } header: {
                     Text("Android Emulator")
-                } footer: {
-                    Text("Full Android runs in an emulator, for the apps the Translation Layer can't run yet. It is experimental: slow, "
-                       + "and it can freeze or crash.")
                 }
             }
             .listStyle(.insetGrouped)
@@ -560,52 +554,25 @@ struct NetworkSettings: View {
     }
 }
 
-// MARK: - JIT and sideloading
+// MARK: - Play without JIT
 
-struct JITSettings: View {
-    @ObservedObject private var runner = QemuRunner.shared
-    @ObservedObject private var jit = JITCoordinator.shared
-    @State private var autoStart = Onboarding.autoStart
-    @AppStorage(JITCoordinator.autoEnableKey) private var autoJIT = false
-    @AppStorage(JITCoordinator.trollStoreAutoKey) private var trollStoreJIT = true
-    @State private var keepAttached = JITBootstrap.keepDebuggerAttached
+struct JITLessSettings: View {
     @AppStorage(JITLess.key) private var jitless = false
     @ObservedObject private var certificate = SigningCertificate.shared
     @State private var pickedP12: Data?
     @State private var p12Password = ""
     @State private var cacheBytes = JITLess.cacheBytes
 
-    private var pairingLabel: String {
-        switch jit.pairingSource {
-        case .onDevice: return "paired on this device"
-        case .imported: return "file imported"
-        case nil: return "not set up"
-        }
-    }
-
     var body: some View {
         HuskForm {
             Section {
-                JITCard()
-            }
-            .listRowInsets(EdgeInsets())
-            .listRowBackground(Color.clear)
-
-            Section {
-                Toggle("JIT-less Mode", isOn: $jitless)
-                DetailRow(label: "Prebuilt games", value: JITLess.libraryCount > 0 ? "Geometry Dash" : "none in this build", mono: false)
+                Toggle("Play without JIT", isOn: $jitless)
                 if cacheBytes > 0 {
                     DetailRow(label: "Converted games", value: ByteCountFormatter.string(fromByteCount: cacheBytes, countStyle: .file), mono: false)
                     Button(role: .destructive) {
                         JITLess.clearCache(); cacheBytes = JITLess.cacheBytes
                     } label: { Label("Remove Converted Games", systemImage: "trash") }
                 }
-            } header: {
-                Text("Experimental")
-            } footer: {
-                Text("Android games run without JIT: their code is converted once and signed with your developer certificate, so no "
-                   + "debugger is needed. The first start of each game takes a few seconds longer. Geode mods and engines that "
-                   + "make code while they run still need JIT. While this is on, Husk makes no executable memory, even when JIT is on.")
             }
             .onAppear { cacheBytes = JITLess.cacheBytes }
 
@@ -626,7 +593,7 @@ struct JITSettings: View {
                     } label: { Label("Import from \(store.title)", systemImage: "arrow.down.circle") }
                 }
                 Button {
-                    HuskFilePicker.present(types: [.pkcs12, .data], multiple: false, onPick: { urls in
+                    HuskFilePicker.present(types: [.pkcs12, .data], multiple: false, asCopy: true, onPick: { urls in
                         guard let url = urls.first else { return }
                         let scoped = url.startAccessingSecurityScopedResource()
                         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
@@ -642,36 +609,63 @@ struct JITSettings: View {
                     Text(why).font(.caption).foregroundStyle(.orange)
                 }
             } header: {
-                Text("Signing Certificate")
-            } footer: {
-                Text("JIT-less mode signs converted games with the certificate your store installed Husk with "
-                   + "\(SigningCertificate.installedTeamID.map { "(team \($0))" } ?? ""). SideStore and AltStore can hand it over; "
-                   + "or import the .p12 file and its password. It stays in this device's Keychain. A free Apple ID's certificate "
-                   + "changes every 7 days: import it again after refreshing Husk, and games are signed again on their next start.")
+                Text("Certificate")
             }
-            .sheet(isPresented: Binding(get: { pickedP12 != nil }, set: { if !$0 { pickedP12 = nil } })) {
-                NavigationView {
-                    Form {
-                        Section {
-                            SecureField("Password (empty if none)", text: $p12Password)
-                                .textContentType(.password)
-                        } footer: {
-                            Text("The password the .p12 file was exported with.")
-                        }
+        }
+        .huskForm()
+        .navigationTitle("Play without JIT")
+        .sheet(isPresented: Binding(get: { pickedP12 != nil }, set: { if !$0 { pickedP12 = nil } })) {
+            NavigationView {
+                Form {
+                    Section {
+                        SecureField("Password", text: $p12Password)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    } footer: {
+                        Text("Enter the password for the private key. Leave it blank if no password is required.")
                     }
-                    .navigationTitle("Certificate Password")
-                    .navigationBarTitleDisplayMode(.inline)
-                    .toolbar {
-                        ToolbarItem(placement: .cancellationAction) { Button("Cancel") { pickedP12 = nil } }
-                        ToolbarItem(placement: .confirmationAction) {
-                            Button("Import") {
-                                if let data = pickedP12 { certificate.importP12(data, password: p12Password) }
-                                pickedP12 = nil
-                            }
+                }
+                .navigationTitle("Certificate Password")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) { Button("Cancel") { pickedP12 = nil } }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Import") {
+                            if let data = pickedP12 { certificate.importP12(data, password: p12Password) }
+                            pickedP12 = nil
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+// MARK: - JIT and sideloading
+
+struct JITSettings: View {
+    @ObservedObject private var runner = QemuRunner.shared
+    @ObservedObject private var jit = JITCoordinator.shared
+    @State private var autoStart = Onboarding.autoStart
+    @AppStorage(JITCoordinator.autoEnableKey) private var autoJIT = false
+    @AppStorage(JITCoordinator.trollStoreAutoKey) private var trollStoreJIT = true
+    @State private var keepAttached = JITBootstrap.keepDebuggerAttached
+
+    private var pairingLabel: String {
+        switch jit.pairingSource {
+        case .onDevice: return "paired on this device"
+        case .imported: return "file imported"
+        case nil: return "not set up"
+        }
+    }
+
+    var body: some View {
+        HuskForm {
+            Section {
+                JITCard()
+            }
+            .listRowInsets(EdgeInsets())
+            .listRowBackground(Color.clear)
 
             Section {
                 Picker("Method", selection: $jit.method) {

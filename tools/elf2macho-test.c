@@ -196,10 +196,12 @@ static int check(const char *dylib, const char *so, const char *fn, long arg)
     /* Every page is mapped as its class says: executable pages read + execute, data pages read + write at the very address the code
      * uses for them (so data read at a code address is the relocated data, with no remapping at run time). */
     for (size_t p = 0; p < A.page_count; p++) {
-        vm_prot_t prot = prot_at(rx + p * PAGE), want = (A.page_class[p] & 1) ? VM_PROT_EXECUTE : VM_PROT_WRITE;
+        vm_prot_t prot = prot_at(rx + p * PAGE), want;
+        if (p < A.npages + A.nstub) want = VM_PROT_EXECUTE; /* ld-style __TEXT: image data is r-x; copies are writable */
+        else want = VM_PROT_WRITE;
         if ((prot & (VM_PROT_WRITE | VM_PROT_EXECUTE)) != want) {
             fprintf(stderr, "FAIL: page %zu is %c%c%c, expected %s\n", p, prot & 1 ? 'r' : '-', prot & 2 ? 'w' : '-', prot & 4 ? 'x' : '-',
-                    want == VM_PROT_EXECUTE ? "r-x" : "rw-");
+                    want == VM_PROT_EXECUTE ? "r-x" : want == VM_PROT_WRITE ? "rw-" : "r--");
             return 1;
         }
     }
@@ -243,7 +245,7 @@ int main(int argc, char **argv)
         if (getenv("TL_P12") && !(p12 = slurp(getenv("TL_P12"), &p12len))) return 1;
         char err[300] = "";
         int n = husk_aot_prepare((const char *const *)argv + 3, argc - 3, argv[2], p12, p12len, getenv("TL_P12_PASSWORD") ? getenv("TL_P12_PASSWORD") : "",
-                                 p12 ? "test-p12" : "adhoc", NULL, NULL, err, sizeof(err));
+                                 p12 ? "test-p12" : "adhoc", getenv("TL_SIGN_IDENT"), NULL, NULL, err, sizeof(err));
         if (n < 0) { fprintf(stderr, "prepare failed: %s\n", err); return 1; }
         printf("%d libraries ready in %s\n", n, argv[2]);
         return 0;

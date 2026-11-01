@@ -20,7 +20,9 @@
 
 #include "husk-tl-internal.h"
 #include "husk-tl-a64.h"
+#include "husk-tl-arm32.h"
 #include "husk-tl-xmem.h"
+#include "husk-tl-codewrite.h"
 
 /* The project's log sink, and the bionic shim's surface. */
 void  tl_log_line(const char *fmt, ...);
@@ -114,11 +116,13 @@ struct tl_lib {
     size_t n_reloc_code;           /* imported: relocations that name a code page, which a dylib maps read-only, so were not applied */
     bool system;                   /* from the runtime's own folders (an APEX's lib64), not the app: what it needs comes from there too */
     bool aot;                      /* imported from a dylib made ahead of time (tl_ld_aot_build): its code is already rewritten and read-only */
+    bool arm32;                    /* ELF32 ARM, translated to AArch64 (husk-tl-arm32.c) */
 };
 static inline bool data_page(const tl_lib *L, size_t page);
 static bool in_code(const tl_lib *L, uint64_t vaddr);
 static bool writable_range(const tl_lib *L, uint64_t lo, uint64_t hi);
 static inline bool writable_vaddr(const tl_lib *L, uint64_t va) { return writable_range(L, va, va + 1); }
+static bool redirect_data(const tl_lib *L, uint64_t vaddr);
 
 /*
  * Whether a page's data is kept in a writable copy after the image (see map_library). A library built for 16 KiB pages has code and
@@ -172,6 +176,9 @@ void tl_ld_set_verbosity(int v) { G.verbosity = v; }
 void tl_ld_set_environment(char **argv, char **envp) { G.argv = argv; G.envp = envp; }
 size_t tl_ld_unresolved_count(void) { return G.unresolved; }
 
+static void (*g_on_init)(tl_lib *);
+void tl_ld_on_init(void (*fn)(tl_lib *lib)) { g_on_init = fn; }
+
 /* The image's bytes at `vaddr`: through the writable view, which for a mixed page is its copy (the dylib's own page there is the
  * unrelocated, executable one). */
 static inline const void *at(const tl_lib *L, uint64_t vaddr) { return waddr(L, vaddr - L->base_vaddr); }
@@ -218,66 +225,111 @@ bool tl_ld_add_apk(const char *path)
     return true;
 }
 
+void tl_ld_reset_session(void)
+{
+    pthread_mutex_lock(&g_big);
+    for (int i = 0; i < G.napks; i++) tl_zip_close(&G.apks[i]);
+    G.napks = 0;
+    g_nsplits = 0;
+    memset(g_apk_paths, 0, sizeof(g_apk_paths));
+    memset(g_splits, 0, sizeof(g_splits));
+    int keep = 0;
+    for (int i = 0; i < G.nlibs; i++) {
+        tl_lib *L = G.libs[i];
+        if (L->system) G.libs[keep++] = L;
+        else { L->name[0] = 0; L->soname[0] = 0; }
+    }
+    G.nlibs = keep;
+    pthread_mutex_unlock(&g_big);
+    tl_a32_reset();
+    tl_log_line("ld: the app's libraries are forgotten; another APK can load");
+}
+
 const tl_zip *tl_ld_apk_at(int i) { return (i >= 0 && i < G.napks) ? &G.apks[i] : NULL; }
 
-/* Every arm64 library the APKs carry, by file name and size: a game that links SDL into its own library names no SDL library to look for. */
+static const char *const k_lib_dirs[] = { "lib/arm64-v8a/", "lib/armeabi-v7a/", "lib/armeabi/" };
+
+static bool lib_zip_name(const char *nm, size_t l, const char *dir, const char **leaf)
+{
+    size_t d = strlen(dir);
+    if (l < d + 3 || strncmp(nm, dir, d) || strcmp(nm + l - 3, ".so") || strchr(nm + d, '/')) return false;
+    if (leaf) *leaf = nm + d;
+    return true;
+}
+
+/* Every ARM library the APKs carry, by file name and size. arm64 first, then 32-bit names the APK did not already list. */
 int tl_ld_apk_libs(void (*cb)(const char *name, uint64_t size, void *user), void *user)
 {
     int n = 0;
-    for (int i = 0; i < G.napks; i++)
-        for (size_t k = 0; k < G.apks[i].count; k++) {
-            const char *nm = G.apks[i].entries[k].name;
-            size_t l = strlen(nm);
-            if (strncmp(nm, "lib/arm64-v8a/", 14) || l < 18 || strcmp(nm + l - 3, ".so") || strchr(nm + 14, '/')) continue;
-            cb(nm + 14, G.apks[i].entries[k].usize, user); n++;
-        }
+    char seen[256][64]; int nseen = 0;
+    for (int d = 0; d < 3; d++)
+        for (int i = 0; i < G.napks; i++)
+            for (size_t k = 0; k < G.apks[i].count; k++) {
+                const char *nm = G.apks[i].entries[k].name, *leaf;
+                size_t l = strlen(nm);
+                if (!lib_zip_name(nm, l, k_lib_dirs[d], &leaf)) continue;
+                int dup = 0;
+                for (int s = 0; s < nseen; s++) if (!strcmp(seen[s], leaf)) { dup = 1; break; }
+                if (dup) continue;
+                if (nseen < 256) snprintf(seen[nseen++], sizeof(seen[0]), "%s", leaf);
+                cb(leaf, G.apks[i].entries[k].usize, user); n++;
+            }
     return n;
 }
 
-/* The APK (base or split) whose lib/arm64-v8a/ carries a library, or NULL. */
+/* The APK (base or split) whose lib/<abi>/ carries a library, or NULL. */
 const char *tl_ld_lib_apk(const char *name)
 {
     char entry[200];
-    snprintf(entry, sizeof(entry), "lib/arm64-v8a/%s", name);
-    for (int i = 0; i < G.napks; i++) if (tl_zip_find(&G.apks[i], entry)) return g_apk_paths[i];
+    for (int d = 0; d < 3; d++) {
+        snprintf(entry, sizeof(entry), "%s%s", k_lib_dirs[d], name);
+        for (int i = 0; i < G.napks; i++) if (tl_zip_find(&G.apks[i], entry)) return g_apk_paths[i];
+    }
     return NULL;
 }
 
 bool tl_ld_has_lib(const char *name)
 {
     char path[160];
-    snprintf(path, sizeof(path), "lib/arm64-v8a/%s", name);
-    for (int i = 0; i < G.napks; i++) if (tl_zip_find(&G.apks[i], path)) return true;
+    for (int d = 0; d < 3; d++) {
+        snprintf(path, sizeof(path), "%s%s", k_lib_dirs[d], name);
+        for (int i = 0; i < G.napks; i++) if (tl_zip_find(&G.apks[i], path)) return true;
+    }
     return false;
 }
+
+bool tl_ld_is_arm32(const tl_lib *lib) { return lib && lib->arm32; }
 
 static bool fetch_from_apks(const char *name, uint8_t **out, size_t *len)
 {
     char path[160];
-    snprintf(path, sizeof(path), "lib/arm64-v8a/%s", name);
-    for (int i = 0; i < G.napks; i++) {
-        const tl_zip_entry *e = tl_zip_find(&G.apks[i], path);
-        if (!e) continue;
-        /* inflated straight into the one buffer the image is built from: a 300 MiB libil2cpp
-         * costs 300 MiB here, where a whole-entry read plus a copy cost it twice */
-        char err[160];
-        tl_zip_stream *st = tl_zip_stream_open(&G.apks[i], e, (size_t)1 << 30, err, sizeof(err));
-        if (!st) {
-            tl_log_line("ld: %s: %s", name, err);
-            return false;
+    for (int d = 0; d < 3; d++) {
+        snprintf(path, sizeof(path), "%s%s", k_lib_dirs[d], name);
+        for (int i = 0; i < G.napks; i++) {
+            const tl_zip_entry *e = tl_zip_find(&G.apks[i], path);
+            if (!e) continue;
+            /* inflated straight into the one buffer the image is built from: a 300 MiB libil2cpp
+             * costs 300 MiB here, where a whole-entry read plus a copy cost it twice */
+            char err[160];
+            tl_zip_stream *st = tl_zip_stream_open(&G.apks[i], e, (size_t)1 << 30, err, sizeof(err));
+            if (!st) {
+                tl_log_line("ld: %s: %s", name, err);
+                return false;
+            }
+            size_t n = (size_t)tl_zip_stream_len(st);
+            uint8_t *buf = malloc(n ? n : 1);
+            size_t got = n && buf ? tl_zip_stream_read(st, buf, n, err, sizeof(err)) : 0;
+            tl_zip_stream_close(st);
+            if (!buf || got != n) {
+                free(buf);
+                tl_log_line("ld: %s: %s", name, got != n ? err : "out of memory");
+                return false;
+            }
+            *out = buf;
+            *len = n;
+            if (d) tl_log_line("ld: %s from %s (32-bit ARM, translated)", name, k_lib_dirs[d]);
+            return true;
         }
-        size_t n = (size_t)tl_zip_stream_len(st);
-        uint8_t *buf = malloc(n ? n : 1);
-        size_t got = n && buf ? tl_zip_stream_read(st, buf, n, err, sizeof(err)) : 0;
-        tl_zip_stream_close(st);
-        if (!buf || got != n) {
-            free(buf);
-            tl_log_line("ld: %s: %s", name, got != n ? err : "out of memory");
-            return false;
-        }
-        *out = buf;
-        *len = n;
-        return true;
     }
     return false;
 }
@@ -342,6 +394,7 @@ static void *sym_value(const tl_lib *L, const elf_sym *s)
 
 static const elf_sym *lib_find(const tl_lib *L, const char *name)
 {
+    if (L->arm32) return NULL;
     if (!L->symtab || !L->strtab) return NULL;
     if (L->gnu_hash) {
         const uint8_t *g = at(L, L->gnu_hash);
@@ -529,10 +582,16 @@ static void *lookup_for(tl_lib *L, const char *name, bool *weak_hit)
 void *tl_ld_sym(tl_lib *lib, const char *name)
 {
     if (lib) {
+        if (lib->arm32) return tl_a32_sym(lib, name);
         const elf_sym *s = lib_find(lib, name);
         return s ? sym_value(lib, s) : NULL;
     }
     for (int i = 0; i < G.nlibs; i++) {
+        if (G.libs[i]->arm32) {
+            void *p = tl_a32_sym(G.libs[i], name);
+            if (p) return p;
+            continue;
+        }
         const elf_sym *s = lib_find(G.libs[i], name);
         if (s) return sym_value(G.libs[i], s);
     }
@@ -544,6 +603,11 @@ void *tl_ld_sym(tl_lib *lib, const char *name)
 void *tl_ld_sym_deep(tl_lib *lib, const char *name, tl_lib **found_in)
 {
     if (!lib) return NULL;
+    if (lib->arm32) {
+        void *p = tl_a32_sym(lib, name);
+        if (p) { if (found_in) *found_in = lib; return p; }
+        return NULL;
+    }
     const elf_sym *s = lib_find(lib, name);
     if (s) { if (found_in) *found_in = lib; return sym_value(lib, s); }
     build_scope(lib);
@@ -564,8 +628,71 @@ tl_lib *tl_ld_lib_of(const void *addr)
         tl_lib *L = G.libs[i];
         size_t span = L->npages * PAGE;
         if ((a >= L->rx && a < L->rx + span) || (a >= L->rw && a < L->rw + span)) return L;
+        if (L->dup && a >= L->dup && a < L->dup + span) return L;
     }
     return NULL;
+}
+
+void *tl_ld_aot_writable(const void *addr, size_t bytes)
+{
+    if (!addr || bytes == 0) return NULL;
+    const uint8_t *a = addr;
+    for (int i = 0; i < G.nlibs; i++) {
+        tl_lib *L = G.libs[i];
+        if (!L->aot || !L->dup) continue;
+        size_t span = L->npages * PAGE;
+        uint64_t off;
+        if (a >= L->rx && a + bytes <= L->rx + span) off = (uint64_t)(a - L->rx);
+        else if (a >= L->dup && a + bytes <= L->dup + span) off = (uint64_t)(a - L->dup);
+        else continue;
+        if (!mixed_page(L, (size_t)(off / PAGE))) continue;
+        return L->dup + off;
+    }
+    return NULL;
+}
+
+void *tl_ld_aot_exec(const void *addr)
+{
+    if (!addr) return NULL;
+    const uint8_t *a = addr;
+    for (int i = 0; i < G.nlibs; i++) {
+        tl_lib *L = G.libs[i];
+        if (!L->aot || !L->dup) continue;
+        size_t span = L->npages * PAGE;
+        if (a < L->dup || a >= L->dup + span) continue;
+        uint64_t off = (uint64_t)(a - L->dup);
+        uint64_t va = L->base_vaddr + off;
+        if (!in_code(L, va)) continue;
+        return L->rx + off;
+    }
+    return NULL;
+}
+
+bool tl_ld_aot_contains(const void *addr)
+{
+    const uint8_t *a = addr;
+    for (int i = 0; i < G.nlibs; i++) {
+        tl_lib *L = G.libs[i];
+        if (!L->aot) continue;
+        size_t span = (L->npages + L->nstub + 2) * PAGE;
+        if (a >= L->rx && a < L->rx + span) return true;
+        if (L->dup && a >= L->dup && a < L->dup + L->npages * PAGE) return true;
+    }
+    return false;
+}
+
+bool tl_ld_covers(const void *addr, size_t bytes)
+{
+    if (!addr || bytes == 0) return false;
+    const uint8_t *lo = addr, *hi = lo + bytes;
+    for (int i = 0; i < G.nlibs; i++) {
+        tl_lib *L = G.libs[i];
+        size_t span = (L->npages + L->nstub + 2) * PAGE;
+        if (L->rx && lo < L->rx + span && hi > L->rx) return true;
+        if (L->rw && L->rw != L->rx && lo < L->rw + span && hi > L->rw) return true;
+        if (L->dup && lo < L->dup + L->npages * PAGE && hi > L->dup) return true;
+    }
+    return false;
 }
 
 const char *tl_ld_lib_name(const tl_lib *lib) { return lib ? lib->name : NULL; }
@@ -924,6 +1051,10 @@ static inline uint32_t e_ldr_lo12(unsigned rt, unsigned rn, const void *target) 
 {
     return 0xF9400000u | ((uint32_t)(((uintptr_t)target & 0xFFFu) >> 3) << 10) | (rn << 5) | rt;
 }
+static inline uint32_t e_ldr_w_lo12(unsigned rt, unsigned rn, const void *target) /* ldr Wt, [Xn, #:lo12:target] (4-byte aligned) */
+{
+    return 0xB9400000u | ((uint32_t)(((uintptr_t)target & 0xFFFu) >> 2) << 10) | (rn << 5) | rt;
+}
 
 static bool stub_in_range(const uint8_t *site, const uint8_t *stub)
 {
@@ -967,6 +1098,26 @@ static bool adr_stub(tl_lib *L, const uint8_t *site_rx, uint32_t rd, const uint8
         e_adrp(rd, rx, target),                                                 /* adrp Xd, target */
         e_add_lo12(rd, rd, target),                                             /* add Xd, Xd, #:lo12:target */
         0x14000000u | ((uint32_t)back & 0x3FFFFFFu),                            /* b site+4 */
+        0xD503201Fu, 0xD503201Fu, 0xD503201Fu, 0xD503201Fu, 0xD503201Fu,
+    };
+    memcpy(rw, code, 32);
+    *branch = 0x14000000u | ((uint32_t)to & 0x3FFFFFFu);
+    return true;
+}
+
+/* `ldr Xt/Wt, label` of a value that lives on a copied data page: load from the copy (adrp+ldr from the stub). */
+static bool ldr_literal_stub(tl_lib *L, const uint8_t *site_rx, uint32_t rt, const uint8_t *src, bool wide, uint32_t *branch)
+{
+    uint8_t *rx, *rw;
+    if (!stub_slot(L, site_rx, &rx, &rw)) return false;
+    if (!e_adrp_ok(rx, src)) { memset(rw, 0, 32); return false; }
+    int64_t to = ((int64_t)rx - (int64_t)site_rx) / 4;
+    int64_t back = ((int64_t)(site_rx + 4) - (int64_t)(rx + 12)) / 4;
+    uint32_t ldr = wide ? e_ldr_lo12(rt, rt, src) : e_ldr_w_lo12(rt, rt, src);
+    uint32_t code[8] = {
+        e_adrp(rt, rx, src),
+        ldr,
+        0x14000000u | ((uint32_t)back & 0x3FFFFFFu),
         0xD503201Fu, 0xD503201Fu, 0xD503201Fu, 0xD503201Fu, 0xD503201Fu,
     };
     memcpy(rw, code, 32);
@@ -1374,10 +1525,22 @@ static void patch_image(tl_lib *L, size_t *n_tpidr, size_t *n_adrp, size_t *n_ad
                 if (tp >= (uintptr_t)L->rx && tp < (uintptr_t)L->rx + L->npages * PAGE) {
                     size_t tpg = (tp - (uintptr_t)L->rx) / PAGE;
                     uint64_t tv = (uint64_t)(tp - (uintptr_t)L->rx) + L->base_vaddr;
-                    if ((data_page(L, tpg) || writable_range(L, tv, tv + 0x1000)) && !adrp_targets_code(L, w, i, nwords, insn & 0x1Fu, tp)) {
+                    if ((data_page(L, tpg) || writable_range(L, tv, tv + 0x1000) || (mixed_page(L, tpg) && !in_code(L, tv)))
+                        && !adrp_targets_code(L, w, i, nwords, insn & 0x1Fu, tp)) {
                         w[i] = encode_adrp(insn & 0x1Fu, pc, data_view(L, (const void *)tp));
                         (*n_adrp)++;
                     }
+                }
+            } else if ((insn & 0xFF000000u) == 0x18000000u || (insn & 0xFF000000u) == 0x58000000u) { /* ldr Wt/Xt, label */
+                int64_t imm = (int64_t)((insn >> 5) & 0x7FFFFu);
+                if (imm & 0x40000) imm -= 0x80000;
+                uintptr_t tp = (uintptr_t)pc + (uintptr_t)(imm * 4);
+                uint64_t tv = (uint64_t)(tp - (uintptr_t)L->rx) + L->base_vaddr;
+                if (tp >= (uintptr_t)L->rx && tp + 8 <= (uintptr_t)L->rx + L->npages * PAGE && redirect_data(L, tv)) {
+                    uint32_t branch;
+                    bool wide = (insn & 0xFF000000u) == 0x58000000u;
+                    if (ldr_literal_stub(L, pc, insn & 0x1Fu, data_view(L, (const void *)tp), wide, &branch)) { w[i] = branch; (*n_adr)++; }
+                    else L->n_adr_failed++;
                 }
             } else if (insn == 0xD4000001u) {                       /* svc #0 */
                 uint8_t *stub = svc_stub(L, pc);
@@ -1396,9 +1559,9 @@ static void patch_image(tl_lib *L, size_t *n_tpidr, size_t *n_adrp, size_t *n_ad
                 int64_t imm = (int64_t)((((insn >> 5) & 0x7FFFFu) << 2) | ((insn >> 29) & 3u));
                 if (imm & 0x100000) imm -= 0x200000;
                 uintptr_t tp = (uintptr_t)pc + (uintptr_t)imm;
+                uint64_t tv = (uint64_t)(tp - (uintptr_t)L->rx) + L->base_vaddr;
                 if (tp >= (uintptr_t)L->rx && tp < (uintptr_t)L->rx + L->npages * PAGE
-                    && (data_page(L, (tp - (uintptr_t)L->rx) / PAGE) || writable_vaddr(L, (uint64_t)(tp - (uintptr_t)L->rx) + L->base_vaddr))
-                    && !in_code(L, (uint64_t)(tp - (uintptr_t)L->rx) + L->base_vaddr)) {
+                    && redirect_data(L, tv)) {
                     uint32_t branch;
                     if (adr_stub(L, pc, insn & 0x1Fu, data_view(L, (const void *)tp), &branch)) { w[i] = branch; (*n_adr)++; }
                     else L->n_adr_failed++;
@@ -1529,10 +1692,25 @@ static bool writable_range(const tl_lib *L, uint64_t lo, uint64_t hi)
     return true;
 }
 
+/* An access that must name the writable copy: mixed/data/writable, and not a code address. */
+static bool redirect_data(const tl_lib *L, uint64_t vaddr)
+{
+    uint64_t off = vaddr - L->base_vaddr;
+    size_t page = (size_t)(off / PAGE);
+    if (page >= L->npages) return false;
+    if (in_code(L, vaddr)) return false;
+    if (mixed_page(L, page)) return true;
+    return data_page(L, page) || writable_vaddr(L, vaddr);
+}
+
 static uint64_t image_addr(const tl_lib *L, uint64_t vaddr)
 {
     uint64_t off = vaddr - L->base_vaddr;
     size_t page = (size_t)(off / PAGE);
+    /* A function's address is always the executable view, even when a mixed page also
+     * holds data: relative C++ vtables add a slot to a vtable pointer, and that pointer
+     * may name the writable copy, but the method itself must still be called. */
+    if (in_code(L, vaddr)) return (uint64_t)(uintptr_t)(L->rx + off);
     if (page < L->npages && writable_vaddr(L, vaddr)) return (uint64_t)(uintptr_t)waddr(L, off);
     if (page < L->npages && data_page(L, page)) {
         if (L->pflags[page] & TL_PAGE_X)
@@ -1575,12 +1753,13 @@ static uint64_t bind_symbol(tl_lib *L, uint32_t symidx, bool *failed)
     return val;
 }
 
-/* A copied page's data is relocated in its copy, which is what the rewritten code reads. In an imported dylib the page itself is
- * mapped too (writable unless it holds code), and code that does not compute its data addresses with adrp/adr -- a literal load in the
- * same page, a pointer table handed to the unwinder -- reads that one: give it the same relocations, the way the JIT region's two
- * views of one memory would. */
+/* A copied page's data is relocated in its copy, which is what the rewritten code reads. In an older dylib layout the original
+ * data page was writable too, and code that does not compute its data addresses with adrp/adr -- a literal load in the same page --
+ * read that one, so the same relocation was applied there. The ld-style AOT dylib maps the whole image as r-x __TEXT (AMFI execSeg),
+ * so writing the original page is a SIGBUS; only the copy is writable. */
 static void reloc_both(tl_lib *L, uint64_t off, size_t bytes)
 {
+    if (L->aot) return;
     if (!mixed_page(L, (size_t)(off / PAGE)) || (L->pflags[off / PAGE] & TL_PAGE_X)) return;   /* executable in the dylib: read-only */
     if (off + bytes > L->npages * PAGE) return;
     memcpy(L->rw + off, L->dup + off, bytes);
@@ -2016,6 +2195,9 @@ static bool aot_alloc(size_t bytes, uint8_t **rx, uint8_t **rw)
  * Importing a library made ahead of time (Husk 3.2): when the folder set with tl_ld_set_aot_dir has <library>'s dylib, made by
  * tl_ld_aot_build from this very file, dyld maps it -- signed code, so no executable memory is made here -- and the loader uses the
  * image's pages in place: code pages executable, data pages writable at their own addresses. Then it relocates and initialises as usual.
+ *
+ * Mixed 4 KiB/16 KiB pages put typeinfo on the writable copy while code runs from the r-x page.
+ * aot_fix_cxx_unwind retargets PT_GNU_EH_FRAME at the copy so catch typeinfo matches the throw.
  */
 static char *g_aot_dir;
 void tl_ld_set_aot_dir(const char *dir) { free(g_aot_dir); g_aot_dir = dir && *dir ? strdup(dir) : NULL; }
@@ -2100,6 +2282,8 @@ static bool aot_import(const char *name, const uint8_t *file, size_t flen, uint6
         if (mixed && mixed[p] && !aot_mapped(mh, PAGE + size + p * PAGE, 1)) why = "its segments do not cover the image";
     if (why) { tl_log_line("ld: %s: its dylib is not used: %s", name, why); return false; }   /* (it stays loaded: dyld cannot be asked to forget it safely) */
     *rx = x; *rw = x; *dup = n_mixed ? x + size : NULL;
+    /* Stores into the r-x image (Unity static constructors, RELRO writes) go to the copies, the way Geode stores go through xmem. */
+    tl_codewrite_enable();
     return true;
 }
 
@@ -2118,8 +2302,23 @@ static void fill_data_slots(tl_lib *L)
 
 static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
 {
+    /* Mix/copy decisions and the dylib's stub count must see the AOT folder before aot_import runs,
+     * otherwise a Mac harness that only sets TL_AOT_DIR in the environment disagrees with the dylib
+     * (which was built with g_aot.on) and refuses to load. The app sets the folder itself. */
+    if (!g_aot_dir && getenv("TL_AOT_DIR")) tl_ld_set_aot_dir(getenv("TL_AOT_DIR"));
     if (G.nlibs >= MAX_LIBS) { tl_log_line("ld: too many libraries"); return NULL; }
     const elf_ehdr *eh = (const elf_ehdr *)file;
+    if (tl_a32_is_elf(file, flen)) {
+        tl_lib *A = calloc(1, sizeof(*A));
+        if (!A) return NULL;
+        if (!tl_a32_map(A, name, file, flen)) { free(A); return NULL; }
+        snprintf(A->name, sizeof(A->name), "%s", name);
+        snprintf(A->soname, sizeof(A->soname), "%s", name);
+        A->arm32 = true;
+        A->state = 2;
+        G.libs[G.nlibs++] = A;
+        return A;
+    }
     if (flen < sizeof(*eh) || memcmp(file, "\x7f""ELF", 4) != 0 || eh->e_ident[4] != 2 || eh->e_ident[5] != 1
         || eh->e_machine != EM_AARCH64_) {
         tl_log_line("ld: %s is not a 64-bit little-endian arm64 ELF image", name);
@@ -2252,7 +2451,17 @@ static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
             mix[p] = 1; n_mixed++;
             if (flags[p] & TL_PAGE_X) n_shared++;
         }
-        if (!n_shared) { memset(mix, 0, npages); n_mixed = 0; }   /* code and data on separate pages: relocated in place */
+        if (!n_shared && !g_aot.on && !g_aot_dir) { memset(mix, 0, npages); n_mixed = 0; }   /* code and data on separate pages: relocated in place */
+        /* A dylib's CodeDirectory execSeg is one file range covering every executable segment. With file offsets matching vaddrs,
+         * that range includes the data pages between __TEXT and later __TEXT_EXEC. Those pages cannot be writable (AMFI) and cannot
+         * be moved in the file (dyld requires increasing file offsets), so every data page of the image is copied after it and the
+         * original is mapped read-only. Build and import must agree on which pages were copied (n_mixed in the manifest). */
+        if (g_aot.on || g_aot_dir) {
+            for (size_t p = 0; p < npages; p++) {
+                if (flags[p] & TL_PAGE_X) continue;
+                if (!mix[p]) { mix[p] = 1; n_mixed++; }
+            }
+        }
     }
     if (n_mixed) tl_log_line("ld: %s: %zu page%s hold%s code and writable data both (built for 4 KiB pages), so its %zu data page%s "
                              "are copied after the image", name, n_shared, n_shared == 1 ? "" : "s", n_shared == 1 ? "s" : "",
@@ -2274,7 +2483,13 @@ static tl_lib *map_library(const char *name, uint8_t *file, size_t flen)
                 int64_t imm = (int64_t)((((v >> 5) & 0x7FFFFu) << 2) | ((v >> 29) & 3u));
                 if (imm & 0x100000) imm -= 0x200000;
                 int64_t tv = (int64_t)(code[r].vaddr + k * 4) + imm - (int64_t)base_vaddr;
-                if (tv >= 0 && (size_t)tv < npages * PAGE && ((flags[(size_t)tv / PAGE] & TL_PAGE_W) || (go && !(flags[(size_t)tv / PAGE] & TL_PAGE_X)))) stub_bytes += 32;
+                if (tv >= 0 && (size_t)tv < npages * PAGE && ((flags[(size_t)tv / PAGE] & TL_PAGE_W) || (go && !(flags[(size_t)tv / PAGE] & TL_PAGE_X)) || mix[(size_t)tv / PAGE])) stub_bytes += 32;
+            }
+            else if ((v & 0xFF000000u) == 0x18000000u || (v & 0xFF000000u) == 0x58000000u) { /* ldr literal of copied data */
+                int64_t imm = (int64_t)((v >> 5) & 0x7FFFFu);
+                if (imm & 0x40000) imm -= 0x80000;
+                int64_t tv = (int64_t)(code[r].vaddr + k * 4) + imm * 4 - (int64_t)base_vaddr;
+                if (tv >= 0 && (size_t)tv < npages * PAGE && (mix[(size_t)tv / PAGE] || (flags[(size_t)tv / PAGE] & TL_PAGE_W))) stub_bytes += 32;
             }
             else if (((v & 31u) == 18 || ((v >> 5) & 31u) == 18 || ((v >> 10) & 31u) == 18 || ((v >> 16) & 31u) == 18) && a64_uses_gpr(v, 18, NULL))
                 stub_bytes += X18_STUB_BYTES;
@@ -2446,8 +2661,161 @@ static void patch_library(tl_lib *L, size_t *t, size_t *a, size_t *ad, size_t *s
     skip_boringssl_selfcheck(L);
 }
 
+/*
+ * An imported AOT dylib has two views of mixed pages: r-x image (where code runs) and a writable
+ * copy after the image (where RELRO / typeinfo live). libc++ finds .eh_frame through
+ * PT_GNU_EH_FRAME at the r-x load bias, so FDE PCs match the throw, but LSDA typeinfo is then
+ * the unrelocated r-x object. The throw's typeinfo is the relocated copy. Catch never matches
+ * (Unity: uncaught Il2CppExceptionWrapper). Point the unwind header at the copy and slide every
+ * pcrel/datarel function address by (rx - dup) so FDE ranges still name the r-x PC. LSDA
+ * pcrel from the copy then names the relocated typeinfo, which is what __cxa_throw stored.
+ */
+static bool aot_add_enc(uint8_t *p, uint8_t enc, int64_t delta)
+{
+    switch (enc & 0x0F) {
+    case 0x0B: {
+        int32_t v; memcpy(&v, p, 4);
+        int64_t n = (int64_t)v + delta;
+        if (n < (int64_t)INT32_MIN || n > (int64_t)INT32_MAX) return false;
+        v = (int32_t)n; memcpy(p, &v, 4); return true;
+    }
+    case 0x03: {
+        uint32_t v; memcpy(&v, p, 4);
+        int64_t n = (int64_t)v + delta;
+        if (n < 0 || n > (int64_t)UINT32_MAX) return false;
+        v = (uint32_t)n; memcpy(p, &v, 4); return true;
+    }
+    case 0x00: case 0x04: case 0x0C: {
+        uint64_t v; memcpy(&v, p, 8);
+        v += (uint64_t)delta; memcpy(p, &v, 8); return true;
+    }
+    default:
+        return false;
+    }
+}
+
+static uint8_t *aot_dup_at(tl_lib *L, uint64_t vaddr, size_t n)
+{
+    if (vaddr < L->base_vaddr) return NULL;
+    uint64_t off = vaddr - L->base_vaddr;
+    if (!L->dup || off + n > L->npages * PAGE) return NULL;
+    if (!mixed_page(L, (size_t)(off / PAGE))) return NULL;
+    return L->dup + off;
+}
+
+static bool aot_slide_cie_personality(uint8_t *cie, uint8_t *end, int64_t delta, size_t *n_pers)
+{
+    if (cie + 12 > end) return false;
+    uint32_t len; memcpy(&len, cie, 4);
+    uint8_t *rec_end = cie + 4 + len;
+    if (len == 0 || len == 0xFFFFFFFFu || rec_end > end) return false;
+    const uint8_t *q = cie + 8, *cend = rec_end;
+    uint8_t version = *q++;
+    const char *aug = (const char *)q;
+    while (q < cend && *q) q++;
+    if (q >= cend) return false;
+    q++;
+    uint64_t t;
+    if (!uleb(&q, cend, &t) || !uleb(&q, cend, &t)) return false;
+    if (version == 1) q++; else if (!uleb(&q, cend, &t)) return false;
+    if (aug[0] != 'z') return true;
+    uint64_t alen; if (!uleb(&q, cend, &alen)) return false;
+    const uint8_t *aend = q + alen;
+    for (const char *a = aug + 1; *a && q < aend; a++) {
+        if (*a == 'R' || *a == 'L') q++;
+        else if (*a == 'P') {
+            uint8_t penc = *q++;
+            int64_t dummy; size_t psz;
+            if (!read_enc(q, aend, (uint8_t)(penc & 0x0F), 0, &dummy, &psz)) return false;
+            if (!(penc & 0x80) && ((penc & 0x70) == 0x10)) {
+                if (!aot_add_enc((uint8_t *)(uintptr_t)q, penc, delta)) return false;
+                (*n_pers)++;
+            }
+            q += psz;
+        } else if (*a == 'S' || *a == 'B') {
+            /* no data */
+        } else break;
+    }
+    return true;
+}
+
+static void aot_fix_cxx_unwind(tl_lib *L)
+{
+    if (!L->aot || !L->dup || L->dup == L->rx) return;
+    int64_t delta = (int64_t)(uintptr_t)L->rx - (int64_t)(uintptr_t)L->dup;
+    if (delta >= (int64_t)INT32_MAX || delta <= (int64_t)INT32_MIN) {
+        tl_log_line("ld: %s: AOT data copy is too far from the image for C++ unwind (%lld)", L->name, (long long)delta);
+        return;
+    }
+    const uint32_t PT_EH = 0x6474e550u;
+    int eh = -1;
+    for (unsigned i = 0; i < L->phnum; i++) if (L->phdr[i].p_type == PT_EH) eh = (int)i;
+    if (eh < 0) return;
+    uint64_t hdr_va = L->phdr[eh].p_vaddr;
+    uint8_t *hdr = aot_dup_at(L, hdr_va, 12);
+    if (!hdr) return;
+    uint8_t *img_end = L->dup + L->npages * PAGE;
+    if (hdr[0] != 1 || hdr[3] != 0x3B) {
+        tl_log_line("ld: %s: AOT unwind header is not version-1 datarel sdata4; C++ catch may still miss", L->name);
+        return;
+    }
+    int64_t ehf, count; size_t s1, s2;
+    if (!read_enc(hdr + 4, img_end, hdr[1], hdr_va + 4, &ehf, &s1)
+        || !read_enc(hdr + 4 + s1, img_end, hdr[2], 0, &count, &s2)) return;
+    uint8_t *tbl = hdr + 4 + s1 + s2;
+    if (count <= 0 || tbl + (size_t)count * 8 > img_end) return;
+
+    size_t n_fde = 0, n_hdr = 0, n_pers = 0;
+    uint64_t last_cie = (uint64_t)-1; uint8_t last_enc = 0;
+    for (int64_t i = 0; i < count; i++) {
+        int32_t start_rel, fde_rel;
+        memcpy(&start_rel, tbl + (size_t)i * 8, 4);
+        memcpy(&fde_rel, tbl + (size_t)i * 8 + 4, 4);
+        int64_t ns = (int64_t)start_rel + delta;
+        if (ns < (int64_t)INT32_MIN || ns > (int64_t)INT32_MAX) {
+            tl_log_line("ld: %s: AOT unwind header start does not fit a 32-bit slide", L->name);
+            return;
+        }
+        int32_t ns32 = (int32_t)ns;
+        memcpy(tbl + (size_t)i * 8, &ns32, 4);
+        n_hdr++;
+
+        uint64_t fde_va = hdr_va + (uint64_t)(int64_t)fde_rel;
+        uint8_t *fde = aot_dup_at(L, fde_va, 12);
+        if (!fde) { tl_log_line("ld: %s: an FDE is not on a copied page; C++ catch may still miss", L->name); return; }
+        uint32_t len, cie_ptr; memcpy(&len, fde, 4); memcpy(&cie_ptr, fde + 4, 4);
+        if (len == 0 || len == 0xFFFFFFFFu || cie_ptr == 0 || fde + 4 + len > img_end) continue;
+        uint64_t cie_va = fde_va + 4 - cie_ptr;
+        uint8_t *cie = aot_dup_at(L, cie_va, 12);
+        if (!cie) continue;
+        if (cie_va != last_cie) {
+            if (!cie_fde_encoding(cie, img_end, &last_enc)) continue;
+            if (!aot_slide_cie_personality(cie, img_end, delta, &n_pers)) {
+                tl_log_line("ld: %s: AOT CIE personality could not be slid", L->name);
+                return;
+            }
+            last_cie = cie_va;
+        }
+        uint8_t *fld = fde + 8;
+        int64_t pc_begin, range; size_t sz1, sz2;
+        if (!read_enc(fld, fde + 4 + len, last_enc, fde_va + 8, &pc_begin, &sz1)) continue;
+        if (!read_enc(fld + sz1, fde + 4 + len, (uint8_t)(last_enc & 0x0F), 0, &range, &sz2)) continue;
+        if ((last_enc & 0x70) == 0x10 || (last_enc & 0x70) == 0x00) {
+            if (!aot_add_enc(fld, last_enc, delta)) {
+                tl_log_line("ld: %s: an FDE PC does not fit the AOT unwind slide", L->name);
+                return;
+            }
+            n_fde++;
+        }
+    }
+    L->phdr[eh].p_vaddr = hdr_va + (uint64_t)(L->dup - L->rx);
+    tl_log_line("ld: %s: AOT C++ unwind tables use the writable copy (%zu FDE PCs, %zu header starts, %zu personalities, slide %lld)",
+                L->name, n_fde, n_hdr, n_pers, (long long)delta);
+}
+
 static bool relocate(tl_lib *L)
 {
+    if (L->arm32) { L->state = 2; return true; }
     size_t count = 0;
     L->state = 1;
     bool ok = do_relas(L, L->rela_src ? L->rela_src : (const uint8_t *)at(L, L->rela), L->relasz, &count)
@@ -2467,6 +2835,7 @@ static bool relocate(tl_lib *L)
          * them). The image's data pages are writable at their own addresses, so all but code pages took their relocations; a code
          * page a relocation names stays as the .so has it. A library built for 4 KiB pages has its data in copies after the image,
          * and reloc_one wrote each relocation there and on the page itself. */
+        aot_fix_cxx_unwind(L);
         L->state = 2;
         if (G.verbosity >= 1) {
             tl_log_line("ld: %-36s imported from its dylib (no executable memory made)", L->name);
@@ -2559,12 +2928,13 @@ static tl_lib *load_locked(const char *name, int depth, bool system)
         return NULL;
     }
     char e[160] = "";
-    bool xmem = tl_xmem_open(768u << 20, e, sizeof(e));
+    bool a32 = tl_a32_is_elf(file, flen);
+    bool xmem = a32 ? true : tl_xmem_open(768u << 20, e, sizeof(e));
     if (!xmem) {   /* only libraries made ahead of time (tl_ld_set_aot_dir) can load: map_library says which cannot */
         static bool said;
         if (!said) { said = true; tl_log_line("ld: no executable memory (%s): only libraries made into dylibs ahead of time can load", e); }
     }
-    if (xmem) {   /* adrp, which the loader uses to retarget code at the writable view, reaches +-4 GiB. */
+    if (xmem && !a32) {   /* adrp, which the loader uses to retarget code at the writable view, reaches +-4 GiB. */
         ptrdiff_t d = tl_xmem_delta();
         if (d > ((ptrdiff_t)3 << 30) || d < -((ptrdiff_t)3 << 30)) { tl_log_line("ld: the writable and executable views are %td MiB apart: too far for adrp", d >> 20); free(file); return NULL; }
     }
@@ -2601,6 +2971,10 @@ static bool init_locked(tl_lib *L)
     if (!L || L->state >= 3) return true;
     if (L->state < 2) return false;
     L->state = 3;
+    if (L->arm32) {
+        for (int i = L->ndeps - 1; i >= 0; i--) init_locked(L->deps[i]);
+        return tl_a32_init(L);
+    }
     build_scope(L);
     /* Needed libraries initialise first, in the order the linker would run them: the
      * deepest dependency first. The BFS list is shallowest-first, so walk it backwards. */
@@ -2631,6 +3005,7 @@ static bool init_locked(tl_lib *L)
     }
     L->state = 4;
     if (G.verbosity >= 1) tl_log_line("ld: %-36s initialised (%s%zu constructors)", L->name, L->init ? "DT_INIT + " : "", (size_t)(L->init_arraysz / 8));
+    if (g_on_init) g_on_init(L);
     return true;
 }
 

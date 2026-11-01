@@ -99,7 +99,7 @@ int main(int argc, char **argv) {
         }
         const char *dylib_path = argv[2];
         char err[512] = {0};
-        bool ok = husk_codesign_dylib(dylib_path, NULL, 0, NULL, err, sizeof(err));
+        bool ok = husk_codesign_dylib(dylib_path, NULL, 0, NULL, NULL, err, sizeof(err));
         if (!ok) {
             fprintf(stderr, "husk_codesign_dylib (ad-hoc) failed: %s\n", err);
             return 1;
@@ -125,7 +125,7 @@ int main(int argc, char **argv) {
     }
 
     char err[512] = {0};
-    bool ok = husk_codesign_dylib(dylib_path, p12_data, p12_len, password, err, sizeof(err));
+    bool ok = husk_codesign_dylib(dylib_path, p12_data, p12_len, password, getenv("TL_SIGN_IDENT"), err, sizeof(err));
     free(p12_data);
 
     if (!ok) {
